@@ -1,0 +1,61 @@
+[project]
+name = "obsidian-wiki"
+version = "0.1.0"
+description = "Système de knowledge base structuré et auto-maintenu par LLM pour le vault Obsidian"
+requires-python = ">=3.12"
+dependencies = [
+    "google-generativeai>=0.8",
+    "pyyaml>=6.0",
+    "python-frontmatter>=1.1",
+    "networkx>=3.2",
+    "matplotlib>=3.8",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+search = [
+    "whoosh>=2.7",
+]
+semantic = [
+    "sentence-transformers>=2.0",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+ingest = "scripts.ingest_all:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bridges", "src", "telegram_commands"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
+ignore = [
+    "PLR0913",
+    "PLR2004",
+    "B008",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
