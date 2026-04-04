@@ -175,7 +175,7 @@ def main() -> int:
     setup_logging(settings.log_level)
 
     console.print("[bold]🔄 obsidian-wiki — Ingestion[/bold]")
-    console.print(f"[dim]Vault : {settings.vault_path}[/dim]")
+    console.print(f"[dim]Vault : {settings.get_vault_path()}[/dim]")
     console.print(f"[dim]Source : {args.source} | Force : {args.force}[/dim]")
 
     if args.dry_run:

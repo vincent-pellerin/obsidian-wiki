@@ -59,7 +59,7 @@ class MediumBridge:
         """Initialise le bridge avec la configuration courante."""
         settings = get_settings()
         self.source_dir = Path(settings.medium_extract_output)
-        self.dest_dir = Path(settings.vault_path) / "00_RAW" / "articles" / "medium"
+        self.dest_dir = Path(settings.get_vault_path()) / "00_RAW" / "articles" / "medium"
 
     def sync_to_raw(self, *, force: bool = False) -> SyncResult:
         """Copie les articles vers 00_RAW/articles/medium/.
@@ -119,7 +119,7 @@ class MediumBridge:
             Liste des chemins d'articles en attente de compilation.
         """
         settings = get_settings()
-        wiki_dir = Path(settings.vault_path) / "02_WIKI"
+        wiki_dir = Path(settings.get_vault_path()) / "02_WIKI"
 
         if not self.dest_dir.exists():
             return []

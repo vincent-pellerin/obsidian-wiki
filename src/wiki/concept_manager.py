@@ -167,7 +167,7 @@ class ConceptManager:
     def __init__(self) -> None:
         """Initialise avec la configuration courante."""
         settings = get_settings()
-        self.wiki_root = Path(settings.vault_path) / "02_WIKI"
+        self.wiki_root = Path(settings.get_vault_path()) / "02_WIKI"
 
     def create_or_update_concept(
         self,

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Système de knowledge base structuré et auto-maintenu par LLM pour le vault Obsidian"
 requires-python = ">=3.12"
 dependencies = [
-    "google-generativeai>=0.8",
+    "google-genai>=1.0",
     "pyyaml>=6.0",
     "python-frontmatter>=1.1",
     "networkx>=3.2",

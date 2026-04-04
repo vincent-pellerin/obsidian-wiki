@@ -27,7 +27,7 @@ class Linker:
     def __init__(self) -> None:
         """Initialise avec la configuration courante."""
         settings = get_settings()
-        self.vault_path = Path(settings.vault_path)
+        self.vault_path = Path(settings.get_vault_path())
         self.wiki_root = self.vault_path / "02_WIKI"
         self.raw_root = self.vault_path / "00_RAW"
 

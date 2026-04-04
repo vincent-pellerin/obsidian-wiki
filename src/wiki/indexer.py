@@ -33,7 +33,7 @@ class Indexer:
     def __init__(self) -> None:
         """Initialise avec la configuration courante."""
         settings = get_settings()
-        self.wiki_root = Path(settings.vault_path) / "02_WIKI"
+        self.wiki_root = Path(settings.get_vault_path()) / "02_WIKI"
         self.index_dir = self.wiki_root / "Index"
         self.index_path = self.index_dir / INDEX_FILE
 

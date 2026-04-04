@@ -25,12 +25,35 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # Vault
+    # Vault — LOCAL_VAULT_PATH prioritaire si défini (développement local)
+    local_vault_path: str = ""
     vault_path: str = "/home/vincent/obsidian-second-brain-vps"
 
-    # Gemini API
+    def get_vault_path(self) -> str:
+        """Retourne le chemin du vault adapté à l'environnement.
+
+        Priorité : LOCAL_VAULT_PATH (local) > VAULT_PATH (VPS)
+        """
+        return self.local_vault_path if self.local_vault_path else self.vault_path
+
+    # Gemini API — supporte GEMINI_API_KEY ou GOOGLE_API_KEY
     gemini_api_key: str = ""
-    gemini_model_wiki: str = "gemini-2.5-flash-preview-05-20"
+    google_api_key: str = ""
+    gemini_model_wiki: str = "gemini-2.5-flash"
+
+    def get_gemini_api_key(self) -> str:
+        """Retourne la clé API Gemini depuis .env ou variables d'environnement.
+
+        Priorité : GEMINI_API_KEY > GOOGLE_API_KEY
+        """
+        import os
+
+        return (
+            self.gemini_api_key
+            or self.google_api_key
+            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY", "")
+        )
 
     # Bridges
     medium_extract_output: str = "/home/vincent/dev/medium_extract/output"

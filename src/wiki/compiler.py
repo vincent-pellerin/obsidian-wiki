@@ -181,19 +181,17 @@ def _call_gemini(content: str, model_name: str, api_key: str) -> str:
         RuntimeError: Si toutes les tentatives ont échoué.
     """
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError as e:
-        raise RuntimeError("google-generativeai non installé. Lancez : uv sync") from e
+        raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-
+    client = genai.Client(api_key=api_key)
     prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:MAX_ARTICLE_CHARS])
 
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(model=model_name, contents=prompt)
             return response.text
         except Exception as e:
             last_error = e
@@ -228,7 +226,7 @@ class WikiCompiler:
         self.concept_manager = ConceptManager()
         self.linker = Linker()
         self.indexer = Indexer()
-        self.vault_path = Path(settings.vault_path)
+        self.vault_path = Path(settings.get_vault_path())
         self._settings = settings
 
     def compile_article(
@@ -283,7 +281,7 @@ class WikiCompiler:
             raw_response = _call_gemini(
                 content=article_content,
                 model_name=self._settings.gemini_model_wiki,
-                api_key=self._settings.gemini_api_key,
+                api_key=self._settings.get_gemini_api_key(),
             )
         except RuntimeError as e:
             result.errors.append(f"Gemini : {e}")

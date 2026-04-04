@@ -140,10 +140,10 @@ async def cmd_status(update: "Update", context: "ContextTypes.DEFAULT_TYPE") -> 
         from src.config import get_settings
 
         settings = get_settings()
-        vault = Path(settings.vault_path)
+        vault = Path(settings.get_vault_path())
 
         if not vault.exists():
-            await update.message.reply_text(f"❌ Vault introuvable : {settings.vault_path}")
+            await update.message.reply_text(f"❌ Vault introuvable : {settings.get_vault_path()}")
             return
 
         def count_md(path: Path) -> int:

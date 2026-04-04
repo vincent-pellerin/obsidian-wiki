@@ -145,14 +145,15 @@ def main() -> int:
     settings = get_settings()
     setup_logging(settings.log_level)
 
-    # Vérification de la clé API
-    if not settings.gemini_api_key and not args.stats:
-        console.print("[bold red]❌ GEMINI_API_KEY non configurée dans .env[/bold red]")
-        console.print("Copiez .env.example vers .env et renseignez votre clé API.")
+    # Vérification de la clé API (depuis .env ou variables d'environnement système)
+    gemini_key = settings.get_gemini_api_key()
+    if not gemini_key and not args.stats:
+        console.print("[bold red]❌ Clé API non configurée[/bold red]")
+        console.print("Ajoutez GEMINI_API_KEY ou GOOGLE_API_KEY dans .env ou ~/.zshenv")
         return 1
 
     console.print("[bold]🧠 obsidian-wiki — Compilation[/bold]")
-    console.print(f"[dim]Vault : {settings.vault_path}[/dim]")
+    console.print(f"[dim]Vault : {settings.get_vault_path()}[/dim]")
 
     compiler = WikiCompiler()
 
