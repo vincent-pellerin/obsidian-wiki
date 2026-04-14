@@ -69,10 +69,6 @@ obsidian-wiki/
 │   ├── lint_wiki.py            # Health check
 │   └── generate_report.py      # Génération rapport
 │
-├── telegram_commands/          # Commandes Telegram (importées par second-brain-workflow)
-│   ├── __init__.py
-│   └── wiki_commands.py        # /ingest /compile /ask /report /health /search
-│
 ├── pyproject.toml
 ├── .env.example
 └── README.md
@@ -147,21 +143,6 @@ uv run python scripts/lint_wiki.py --report
 qmd search "RAG" -c wiki -n 10           # Recherche rapide (BM25)
 qmd query "comment déployer" -c wiki     # Recherche hybride (meilleure qualité)
 ```
-
----
-
-## Intégration Telegram
-
-Les commandes wiki sont importées dans le bot existant (`second-brain-workflow/telegram_bot.py`) :
-
-```python
-# Dans second-brain-workflow/telegram_bot.py
-from obsidian_wiki.telegram_commands.wiki_commands import register_wiki_handlers
-
-# Les deux projets restent indépendants — interface unifiée
-```
-
-Nouvelles commandes disponibles : `/ingest` `/compile` `/ask` `/report` `/slides` `/search` `/health` `/status`
 
 ---
 

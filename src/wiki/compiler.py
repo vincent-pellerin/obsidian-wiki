@@ -6,11 +6,13 @@ Orchestre le pipeline complet pour chaque article :
   3. Création/mise à jour des fiches dans 02_WIKI/
   4. Ajout des backlinks bidirectionnels
   5. Mise à jour de l'index maître
+  6. Append au journal log.md
 """
 
 import logging
 import re
 import time
+from datetime import date
 from pathlib import Path
 
 import frontmatter
@@ -39,6 +41,64 @@ MAX_ARTICLE_CHARS = 12_000
 # Nombre max de tentatives pour l'appel Gemini
 MAX_RETRIES = 3
 RETRY_DELAY_S = 5.0
+
+# En-tête du journal log.md (créé si le fichier n'existe pas)
+_LOG_HEADER = """\
+# Journal des opérations du wiki
+
+> Ce fichier est auto-maintenu par le système. Ne pas modifier manuellement.
+> Format : `## [YYYY-MM-DD] opération | titre` — parseable par `grep`.
+"""
+
+
+def append_log_entry(
+    vault_path: Path,
+    operation: str,
+    title: str,
+    details: dict[str, str | int] | None = None,
+) -> Path:
+    """Ajoute une entrée au journal log.md du vault.
+
+    Le fichier est créé avec un en-tête s'il n'existe pas. L'entrée est
+    toujours ajoutée à la fin (append-only).
+
+    Args:
+        vault_path: Chemin racine du vault Obsidian.
+        operation: Type d'opération (compile, ingest, lint, query).
+        title: Titre court de l'opération.
+        details: Dictionnaire optionnel de détails clé-valeur.
+
+    Returns:
+        Chemin du fichier log.md.
+    """
+    log_path = vault_path / "02_WIKI" / "log.md"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    today = date.today().isoformat()
+    lines: list[str] = [
+        "",
+        f"## [{today}] {operation} | {title}",
+    ]
+
+    if details:
+        for key, value in details.items():
+            lines.append(f"- {key} : {value}")
+
+    entry = "\n".join(lines) + "\n"
+
+    if log_path.exists():
+        # Append au fichier existant
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+    else:
+        # Créer le fichier avec l'en-tête
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(_LOG_HEADER)
+            f.write(entry)
+
+    logger.info(f"Entrée log.md ajoutée : [{today}] {operation} | {title}")
+    return log_path
+
 
 CONCEPT_EXTRACTION_PROMPT = """\
 Analyse cet article et identifie les éléments suivants.
@@ -466,6 +526,25 @@ class WikiCompiler:
         # Persister le cache après le batch
         if batch.total_compiled > 0:
             self.cache.save()
+
+        # Append au journal log.md
+        if batch.total_compiled > 0:
+            try:
+                append_log_entry(
+                    vault_path=self.vault_path,
+                    operation="compile",
+                    title=f"Batch {batch.total_compiled} articles",
+                    details={
+                        "Source": source,
+                        "Fiches créées": batch.total_concepts_created,
+                        "Fiches mises à jour": batch.total_concepts_updated,
+                        "Erreurs": batch.total_errors,
+                        "Tokens input": batch.total_input_tokens,
+                        "Tokens output": batch.total_output_tokens,
+                    },
+                )
+            except OSError as e:
+                logger.warning(f"Impossible d'écrire dans log.md : {e}")
 
         logger.info(batch.summary())
         return batch
