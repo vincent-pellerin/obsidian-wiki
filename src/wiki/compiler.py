@@ -115,35 +115,47 @@ def append_log_entry(
 
 
 CONCEPT_EXTRACTION_PROMPT = """\
-Analyse cet article et identifie les éléments suivants.
+Analyse cet article et extrais les connaissances structurées.
 Retourne UNIQUEMENT du YAML valide, sans balises markdown, sans commentaires.
 
 Format attendu :
 concepts:
   - name: "Nom du concept"
-    definition: "Définition concise (1-2 phrases)"
-    context: "Comment ce concept est utilisé dans l'article"
+    definition: "Définition autonome et complète (2-3 phrases). Doit être compréhensible sans lire l'article."
+    context: "Comment ce concept est spécifiquement utilisé ou illustré dans cet article"
+    related:
+      - "Concept lié A"
+      - "Concept lié B"
+    questions:
+      - "Question ouverte ou point à approfondir sur ce concept"
     aliases: []
 people:
   - name: "Prénom Nom"
-    role: "Rôle ou titre"
-    context: "Contexte de mention dans l'article"
+    role: "Titre professionnel précis (ex: 'Chercheur en ML chez Google', 'Fondateur de OpenAI')"
+    bio: "Biographie courte (1-2 phrases) : qui est cette personne, pourquoi est-elle notable"
+    context: "Pourquoi cette personne est mentionnée dans cet article"
 technologies:
   - name: "Nom outil/techno"
-    type: "database|framework|library|platform|language|tool"
-    context: "Comment cet outil est utilisé dans l'article"
+    type: "database|framework|library|platform|language|tool|service"
+    description: "Description technique autonome (1-2 phrases) : ce que c'est, à quoi ça sert"
+    context: "Comment cet outil est utilisé ou mentionné dans cet article"
 topics:
   - name: "Sujet principal"
+    definition: "Description du sujet (2-3 phrases) : de quoi il s'agit, pourquoi c'est important"
     related:
       - "sujet lié 1"
       - "sujet lié 2"
 
-Règles :
-- 5 à 10 concepts clés maximum
-- Uniquement les éléments réellement présents dans l'article
-- Définitions en français
+Règles strictes :
+- 3 à 8 concepts clés maximum (qualité > quantité)
+- 1 à 3 topics maximum (les sujets les plus importants de l'article)
+- Uniquement les éléments réellement présents et significatifs dans l'article
+- Toutes les définitions/descriptions en français
+- Les définitions doivent être AUTONOMES : compréhensibles sans contexte de l'article
+- Ne pas dupliquer : si un concept est déjà un topic, ne pas le mettre dans les deux
+- Noms propres (personnes, outils) en langue d'origine
 - Si une catégorie est vide, mettre une liste vide []
-- Noms propres en anglais si c'est la langue d'origine
+- Pour les personnes : ne pas créer de fiche si le rôle est générique (ex: "auteur", "co-auteur", "abonné")
 
 Article :
 {article_content}
@@ -200,17 +212,49 @@ def _parse_gemini_response(raw_text: str) -> ExtractedKnowledge:
                 definition=str(item.get("definition", "")),
                 context=str(item.get("context", "")),
                 aliases=list(item.get("aliases") or []),
+                related=list(item.get("related") or []),
+                questions=list(item.get("questions") or []),
             )
         )
 
-    # People
+    # People — ignorer les rôles génériques sans valeur encyclopédique
+    _GENERIC_ROLES = {
+        "auteur",
+        "auteure",
+        "author",
+        "co-auteur",
+        "co-auteure",
+        "co-author",
+        "abonné",
+        "abonnée",
+        "subscriber",
+        "abonné payant",
+        "abonnée payante",
+        "photographe",
+        "photographer",
+        "soutien",
+        "supporter",
+        "invité",
+        "invitée",
+        "guest",
+        "personnage fictif",
+        "fictional character",
+        "personnage philosophique",
+    }
     for item in data.get("people") or []:
         if not isinstance(item, dict) or not item.get("name"):
+            continue
+        role = str(item.get("role", "")).strip().lower()
+        bio = str(item.get("bio", "")).strip()
+        # Ignorer si rôle générique ET pas de bio substantielle
+        if role in _GENERIC_ROLES and len(bio) < 30:
+            logger.debug(f"Personne ignorée (rôle générique) : {item['name']} ({role})")
             continue
         knowledge.people.append(
             PersonData(
                 name=str(item["name"]),
                 role=str(item.get("role", "")),
+                bio=bio,
                 context=str(item.get("context", "")),
             )
         )
@@ -223,6 +267,7 @@ def _parse_gemini_response(raw_text: str) -> ExtractedKnowledge:
             TechData(
                 name=str(item["name"]),
                 type=str(item.get("type", "tool")),
+                description=str(item.get("description", "")),
                 context=str(item.get("context", "")),
             )
         )
@@ -234,6 +279,7 @@ def _parse_gemini_response(raw_text: str) -> ExtractedKnowledge:
         knowledge.topics.append(
             TopicData(
                 name=str(item["name"]),
+                definition=str(item.get("definition", "")),
                 related=list(item.get("related") or []),
             )
         )

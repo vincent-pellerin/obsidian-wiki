@@ -17,15 +17,19 @@ class ConceptData:
 
     Attributes:
         name: Nom du concept (ex: "GraphRAG").
-        definition: Définition concise en 1-2 phrases.
-        context: Comment ce concept est utilisé dans l'article.
+        definition: Définition autonome et complète (2-3 phrases).
+        context: Comment ce concept est spécifiquement utilisé dans l'article.
         aliases: Noms alternatifs du concept.
+        related: Concepts liés identifiés par le LLM.
+        questions: Questions ouvertes ou points à approfondir.
     """
 
     name: str
     definition: str
     context: str = ""
     aliases: list[str] = field(default_factory=list)
+    related: list[str] = field(default_factory=list)
+    questions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -35,11 +39,13 @@ class PersonData:
     Attributes:
         name: Prénom et nom complet.
         role: Titre ou rôle (ex: "chercheur en ML").
+        bio: Biographie courte (1-2 phrases sur qui est cette personne).
         context: Contexte de mention dans l'article.
     """
 
     name: str
     role: str
+    bio: str = ""
     context: str = ""
 
 
@@ -49,12 +55,14 @@ class TechData:
 
     Attributes:
         name: Nom de la technologie (ex: "Neo4j").
-        type: Catégorie (database|framework|library|platform|language|tool).
-        context: Usage dans l'article.
+        type: Catégorie (database|framework|library|platform|language|tool|service).
+        description: Description technique autonome (ce que c'est, à quoi ça sert).
+        context: Usage spécifique dans l'article.
     """
 
     name: str
     type: str
+    description: str = ""
     context: str = ""
 
 
@@ -64,10 +72,12 @@ class TopicData:
 
     Attributes:
         name: Nom du sujet (ex: "Knowledge Graphs").
+        definition: Description du sujet (1-2 phrases).
         related: Sujets liés.
     """
 
     name: str
+    definition: str = ""
     related: list[str] = field(default_factory=list)
 
 

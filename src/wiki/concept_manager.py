@@ -93,6 +93,8 @@ def _build_concept_content(
     source_stem: str,
     source_title: str,
     category: str = "",
+    related: list[str] | None = None,
+    questions: list[str] | None = None,
 ) -> str:
     """Construit le contenu Markdown d'une nouvelle fiche concept.
 
@@ -105,6 +107,8 @@ def _build_concept_content(
         source_stem: Identifiant de l'article source (nom du fichier sans .md).
         source_title: Titre lisible de l'article source.
         category: Catégorie thématique (optionnel).
+        related: Concepts liés identifiés par le LLM.
+        questions: Questions ouvertes sur ce concept.
 
     Returns:
         Contenu Markdown complet de la fiche.
@@ -128,6 +132,18 @@ def _build_concept_content(
         f"- [[{source_stem}]] — {source_title}" if source_title else f"- [[{source_stem}]]"
     )
 
+    # Section "Concepts liés"
+    if related:
+        related_lines = "\n".join(f"- [[{r}]]" for r in related)
+    else:
+        related_lines = "_À compléter_"
+
+    # Section "Questions ouvertes"
+    if questions:
+        questions_lines = "\n".join(f"- {q}" for q in questions)
+    else:
+        questions_lines = "_À compléter_"
+
     content = f"""---
 {frontmatter_str}
 ---
@@ -148,11 +164,11 @@ def _build_concept_content(
 
 ## Concepts liés
 
-_À compléter_
+{related_lines}
 
 ## Questions ouvertes
 
-_À compléter_
+{questions_lines}
 """
     return content
 
@@ -285,6 +301,8 @@ class ConceptManager:
             aliases=data.aliases,
             source_stem=source_stem,
             source_title=source_title,
+            related=data.related,
+            questions=data.questions,
         )
 
     def create_or_update_person(
@@ -295,6 +313,9 @@ class ConceptManager:
     ) -> tuple[Path, bool]:
         """Crée ou met à jour la fiche d'une personne.
 
+        La biographie (data.bio) est utilisée comme contenu principal.
+        Le rôle est ajouté en complément si la bio est absente.
+
         Args:
             data: Données de la personne extraites par le LLM.
             source_stem: Nom du fichier source sans extension.
@@ -303,10 +324,12 @@ class ConceptManager:
         Returns:
             Tuple (chemin_fichier, created) où created=True si nouvelle fiche.
         """
+        # Utiliser la bio comme définition principale ; fallback sur le rôle
+        definition = data.bio if data.bio else data.role
         return self._upsert(
             name=data.name,
             wiki_type="person",
-            definition=data.role,
+            definition=definition,
             context=data.context,
             aliases=[],
             source_stem=source_stem,
@@ -321,6 +344,9 @@ class ConceptManager:
     ) -> tuple[Path, bool]:
         """Crée ou met à jour la fiche d'une technologie.
 
+        La description autonome (data.description) est utilisée comme définition.
+        Le type est stocké dans le frontmatter (category), pas dans la définition.
+
         Args:
             data: Données de la technologie extraites par le LLM.
             source_stem: Nom du fichier source sans extension.
@@ -329,10 +355,12 @@ class ConceptManager:
         Returns:
             Tuple (chemin_fichier, created) où created=True si nouvelle fiche.
         """
+        # Utiliser la description autonome ; fallback sur le contexte si absente
+        definition = data.description if data.description else data.context
         return self._upsert(
             name=data.name,
             wiki_type="technology",
-            definition=f"**Type** : {data.type}\n\n{data.context}",
+            definition=definition,
             context=data.context,
             aliases=[],
             source_stem=source_stem,
@@ -348,6 +376,9 @@ class ConceptManager:
     ) -> tuple[Path, bool]:
         """Crée ou met à jour la fiche d'un topic.
 
+        La définition du sujet (data.definition) est utilisée comme contenu principal.
+        Les sujets liés sont passés comme related pour peupler la section "Concepts liés".
+
         Args:
             data: Données du topic extraites par le LLM.
             source_stem: Nom du fichier source sans extension.
@@ -356,15 +387,15 @@ class ConceptManager:
         Returns:
             Tuple (chemin_fichier, created) où created=True si nouvelle fiche.
         """
-        related_str = ", ".join(data.related) if data.related else ""
         return self._upsert(
             name=data.name,
             wiki_type="topic",
-            definition=f"Sujet : {data.name}",
-            context=f"Sujets liés : {related_str}" if related_str else "",
+            definition=data.definition or f"Sujet : {data.name}",
+            context="",
             aliases=[],
             source_stem=source_stem,
             source_title=source_title,
+            related=data.related,
         )
 
     def get_concept_path(self, name: str, wiki_type: str = "concept") -> Path | None:
@@ -414,6 +445,8 @@ class ConceptManager:
         source_stem: str,
         source_title: str,
         category: str = "",
+        related: list[str] | None = None,
+        questions: list[str] | None = None,
     ) -> tuple[Path, bool]:
         """Crée ou met à jour une fiche wiki.
 
@@ -426,6 +459,8 @@ class ConceptManager:
             source_stem: Identifiant de l'article source.
             source_title: Titre de l'article source.
             category: Catégorie optionnelle.
+            related: Concepts liés (pour la section "Concepts liés").
+            questions: Questions ouvertes (pour la section "Questions ouvertes").
 
         Returns:
             Tuple (chemin_fichier, created).
@@ -437,6 +472,26 @@ class ConceptManager:
         file_path = target_dir / filename
 
         if not file_path.exists():
+            # Déduplication cross-catégorie : vérifier si le concept existe déjà
+            # dans une autre catégorie avant de créer un doublon
+            existing = self.find_fiche_by_name(name)
+            if existing and existing != file_path:
+                logger.debug(
+                    f"Déduplication : '{name}' existe déjà dans {existing.parent.name}, "
+                    f"skip création dans {target_dir.name}"
+                )
+                updated = self._add_source_to_existing(existing, source_stem, source_title)
+                if updated and self._cache:
+                    state = self._cache.get_fiche_state(existing.stem)
+                    current_count = state["source_count"] if state else 1
+                    self._cache.set_fiche_state(
+                        existing,
+                        wiki_type=wiki_type,
+                        source_count=current_count + 1,
+                        title=name,
+                    )
+                return existing, False
+
             # Création
             content = _build_concept_content(
                 name=name,
@@ -447,6 +502,8 @@ class ConceptManager:
                 source_stem=source_stem,
                 source_title=source_title,
                 category=category,
+                related=related,
+                questions=questions,
             )
             file_path.write_text(content, encoding="utf-8")
             logger.info(f"Fiche créée : {file_path.relative_to(self.wiki_root)}")

@@ -429,6 +429,38 @@ class WikiStateCache:
         self.save()
         logger.info("Cache wiki reconstruit et sauvegardé.")
 
+    def reset_wiki_fiches(self) -> int:
+        """Vide l'index des fiches wiki et des backlinks.
+
+        À utiliser avant un reset complet du wiki (suppression des fiches).
+
+        Returns:
+            Nombre de fiches supprimées du cache.
+        """
+        count = len(self._data.get("wiki_fiches", {}))
+        self._data["wiki_fiches"] = {}
+        self._data["backlinks"] = {}
+        logger.info(f"Cache fiches vidé : {count} entrées supprimées")
+        return count
+
+    def reset_compiled_articles(self) -> int:
+        """Remet à zéro le flag wiki_compiled de tous les articles dans le cache.
+
+        Conserve les métadonnées (mtime, hash) mais marque tous les articles
+        comme non compilés, pour forcer une recompilation complète.
+
+        Returns:
+            Nombre d'articles remis à zéro.
+        """
+        count = 0
+        for key, state in self._data.get("articles", {}).items():
+            if state.get("wiki_compiled"):
+                state["wiki_compiled"] = False
+                state["concepts"] = []
+                count += 1
+        logger.info(f"Cache articles remis à zéro : {count} articles")
+        return count
+
     def is_empty(self) -> bool:
         """Vérifie si le cache est vide (premier lancement).
 
