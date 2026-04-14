@@ -580,17 +580,18 @@ class WikiCompiler:
 
         logger.info(f"Batch API : {len(pending)} articles à compiler (source={source})")
 
-        # 2. Construire les requêtes inline
-        inline_requests: list[dict] = []
+        # 2. Construire les requêtes inline avec le bon format Pydantic
+        from google.genai import types as genai_types
+
+        inline_requests: list[genai_types.InlinedRequest] = []
         for article_path, title, content in pending:
             prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:MAX_ARTICLE_CHARS])
             inline_requests.append(
-                {
-                    "key": article_path.stem,
-                    "request": {
-                        "contents": [{"parts": [{"text": prompt}]}],
-                    },
-                }
+                genai_types.InlinedRequest(
+                    contents=prompt,
+                    # La clé est stockée dans metadata pour retrouver l'article
+                    metadata={"key": article_path.stem},
+                )
             )
 
         # 3. Soumettre le batch job
@@ -635,7 +636,10 @@ class WikiCompiler:
             return batch_result
 
         for i, inline_response in enumerate(responses):
-            key = inline_response.key if hasattr(inline_response, "key") else str(i)
+            # La clé est dans metadata (nouveau format API)
+            key = str(i)
+            if hasattr(inline_response, "metadata") and inline_response.metadata:
+                key = inline_response.metadata.get("key", str(i))
             article_path, article_title = article_index.get(key, (Path(f"unknown/{key}"), key))
             result = CompilationResult(article_path=article_path, article_title=article_title)
 
@@ -647,14 +651,25 @@ class WikiCompiler:
 
             # Extraire le texte de la réponse
             try:
+                raw_text = None
                 if hasattr(inline_response, "response") and inline_response.response:
-                    raw_text = inline_response.response.text
-                else:
+                    resp = inline_response.response
+                    # Naviguer dans candidates → content → parts → text
+                    if hasattr(resp, "candidates") and resp.candidates:
+                        cand = resp.candidates[0]
+                        if hasattr(cand, "content") and cand.content:
+                            parts = cand.content.parts or []
+                            if parts and hasattr(parts[0], "text"):
+                                raw_text = parts[0].text
+                    # Fallback : attribut .text direct
+                    if raw_text is None and hasattr(resp, "text"):
+                        raw_text = resp.text
+                if not raw_text:
                     result.errors.append("Réponse vide du batch API")
                     batch_result.results.append(result)
                     continue
-            except AttributeError:
-                result.errors.append("Format de réponse inattendu")
+            except (AttributeError, IndexError) as e:
+                result.errors.append(f"Format de réponse inattendu : {e}")
                 batch_result.results.append(result)
                 continue
 
@@ -755,7 +770,10 @@ class WikiCompiler:
         responses = batch_job.dest.inlined_responses if batch_job.dest else []
 
         for i, inline_response in enumerate(responses):
-            key = inline_response.key if hasattr(inline_response, "key") else str(i)
+            # La clé est dans metadata (nouveau format API)
+            key = str(i)
+            if hasattr(inline_response, "metadata") and inline_response.metadata:
+                key = inline_response.metadata.get("key", str(i))
             article_path, article_title = article_index.get(key, (Path(f"unknown/{key}"), key))
             result = CompilationResult(article_path=article_path, article_title=article_title)
 
@@ -765,14 +783,23 @@ class WikiCompiler:
                 continue
 
             try:
+                raw_text = None
                 if hasattr(inline_response, "response") and inline_response.response:
-                    raw_text = inline_response.response.text
-                else:
+                    resp = inline_response.response
+                    if hasattr(resp, "candidates") and resp.candidates:
+                        cand = resp.candidates[0]
+                        if hasattr(cand, "content") and cand.content:
+                            parts = cand.content.parts or []
+                            if parts and hasattr(parts[0], "text"):
+                                raw_text = parts[0].text
+                    if raw_text is None and hasattr(resp, "text"):
+                        raw_text = resp.text
+                if not raw_text:
                     result.errors.append("Réponse vide du batch API")
                     batch_result.results.append(result)
                     continue
-            except AttributeError:
-                result.errors.append("Format de réponse inattendu")
+            except (AttributeError, IndexError) as e:
+                result.errors.append(f"Format de réponse inattendu : {e}")
                 batch_result.results.append(result)
                 continue
 
