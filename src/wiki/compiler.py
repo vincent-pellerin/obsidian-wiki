@@ -7,6 +7,11 @@ Orchestre le pipeline complet pour chaque article :
   4. Ajout des backlinks bidirectionnels
   5. Mise à jour de l'index maître
   6. Append au journal log.md
+
+Deux modes de compilation :
+  - Synchrone (défaut) : un article à la fois via generate_content
+  - Batch API (--batch) : soumission groupée via client.batches.create,
+    résultats récupérés après completion (50% moins cher)
 """
 
 import logging
@@ -41,6 +46,15 @@ MAX_ARTICLE_CHARS = 12_000
 # Nombre max de tentatives pour l'appel Gemini
 MAX_RETRIES = 3
 RETRY_DELAY_S = 5.0
+
+# Paramètres Batch API
+BATCH_POLL_INTERVAL_S = 30
+BATCH_COMPLETED_STATES = {
+    "JOB_STATE_SUCCEEDED",
+    "JOB_STATE_FAILED",
+    "JOB_STATE_CANCELLED",
+    "JOB_STATE_EXPIRED",
+}
 
 # En-tête du journal log.md (créé si le fichier n'existe pas)
 _LOG_HEADER = """\
@@ -376,114 +390,19 @@ class WikiCompiler:
             return result
 
         logger.debug(f"Réponse brute Gemini ({len(raw_response)} chars) :\n{raw_response[:2000]}")
-        knowledge = _parse_gemini_response(raw_response)
 
-        if knowledge.is_empty():
-            logger.warning(
-                f"Réponse Gemini vide ou invalide pour {raw_path.name}. "
-                f"Réponse brute (500 premiers chars) : {raw_response[:500]!r}"
-            )
-            result.errors.append("Aucune connaissance extraite (réponse Gemini vide ou invalide)")
-            return result
-
-        logger.info(
-            f"Extrait : {len(knowledge.concepts)} concepts, "
-            f"{len(knowledge.people)} personnes, "
-            f"{len(knowledge.technologies)} techs, "
-            f"{len(knowledge.topics)} topics"
+        # Traiter le résultat via la méthode partagée
+        self._process_extraction_result(
+            raw_text=raw_response,
+            raw_path=raw_path,
+            article_title=result.article_title,
+            result=result,
         )
 
-        source_stem = raw_path.stem
-        source_title = result.article_title
-        all_concept_names: list[str] = []
+        # Copier les tokens (définis avant _process_extraction_result)
+        result.input_tokens = input_tokens
+        result.output_tokens = output_tokens
 
-        # Traitement des concepts
-        for concept_data in knowledge.concepts:
-            try:
-                path, created = self.concept_manager.create_or_update_concept(
-                    concept_data, source_stem, source_title
-                )
-                if created:
-                    result.concepts_created += 1
-                else:
-                    result.concepts_updated += 1
-                all_concept_names.append(concept_data.name)
-            except Exception as e:
-                logger.error(f"Concept '{concept_data.name}' : {e}")
-                result.errors.append(f"Concept '{concept_data.name}' : {e}")
-
-        # Traitement des personnes
-        for person_data in knowledge.people:
-            try:
-                path, created = self.concept_manager.create_or_update_person(
-                    person_data, source_stem, source_title
-                )
-                if created:
-                    result.concepts_created += 1
-                else:
-                    result.concepts_updated += 1
-                all_concept_names.append(person_data.name)
-            except Exception as e:
-                logger.error(f"Personne '{person_data.name}' : {e}")
-                result.errors.append(f"Personne '{person_data.name}' : {e}")
-
-        # Traitement des technologies
-        for tech_data in knowledge.technologies:
-            try:
-                path, created = self.concept_manager.create_or_update_technology(
-                    tech_data, source_stem, source_title
-                )
-                if created:
-                    result.concepts_created += 1
-                else:
-                    result.concepts_updated += 1
-                all_concept_names.append(tech_data.name)
-            except Exception as e:
-                logger.error(f"Tech '{tech_data.name}' : {e}")
-                result.errors.append(f"Tech '{tech_data.name}' : {e}")
-
-        # Traitement des topics
-        for topic_data in knowledge.topics:
-            try:
-                path, created = self.concept_manager.create_or_update_topic(
-                    topic_data, source_stem, source_title
-                )
-                if created:
-                    result.concepts_created += 1
-                else:
-                    result.concepts_updated += 1
-                all_concept_names.append(topic_data.name)
-                # Lier les topics entre eux (related)
-                if topic_data.related and path:
-                    self.linker.add_related_concepts(path, topic_data.related)
-            except Exception as e:
-                logger.error(f"Topic '{topic_data.name}' : {e}")
-                result.errors.append(f"Topic '{topic_data.name}' : {e}")
-
-        # Backlinks : article → concepts
-        if all_concept_names:
-            added = self.linker.add_concepts_to_article(raw_path, all_concept_names)
-            result.backlinks_created = added
-
-        # Marquer l'article comme compilé dans le frontmatter
-        self._mark_compiled(raw_path, post, knowledge)
-
-        # Mettre à jour le cache avec l'état de compilation
-        self.cache.set_article_state(
-            raw_path,
-            wiki_compiled=True,
-            concepts=all_concept_names,
-        )
-        # Mettre à jour les backlinks dans le cache
-        for concept_name in all_concept_names:
-            self.cache.add_backlink(concept_name, source_stem)
-
-        logger.info(
-            f"✅ {raw_path.name} : "
-            f"{result.concepts_created} créés, "
-            f"{result.concepts_updated} mis à jour, "
-            f"{result.backlinks_created} liens"
-        )
         return result
 
     def batch_compile(
@@ -548,6 +467,431 @@ class WikiCompiler:
 
         logger.info(batch.summary())
         return batch
+
+    # ------------------------------------------------------------------
+    # Mode Batch API Gemini
+    # ------------------------------------------------------------------
+
+    def batch_compile_api(
+        self,
+        source: str = "all",
+        limit: int | None = None,
+        *,
+        force: bool = False,
+        rebuild_index: bool = True,
+    ) -> BatchCompilationResult:
+        """Compile les articles via la Gemini Batch API (50% moins cher).
+
+        Soumet toutes les requêtes en un seul batch job, puis récupère
+        les résultats après completion pour traiter les fiches wiki.
+
+        Args:
+            source: Source à compiler ("medium", "substack", ou "all").
+            limit: Nombre maximum d'articles à traiter.
+            force: Si True, recompile les articles déjà compilés.
+            rebuild_index: Si True, régénère l'index maître à la fin.
+
+        Returns:
+            BatchCompilationResult avec l'agrégat des résultats.
+
+        Raises:
+            RuntimeError: Si la soumission ou la récupération échoue.
+        """
+        try:
+            from google import genai
+        except ImportError as e:
+            raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
+
+        # 1. Collecter les articles à compiler
+        articles = self._collect_articles(source)
+        if limit:
+            articles = articles[:limit]
+
+        # Filtrer les articles déjà compilés (sauf force)
+        pending: list[tuple[Path, str, str]] = []  # (path, title, content)
+        for article_path in articles:
+            try:
+                post = frontmatter.load(str(article_path))
+            except Exception as e:
+                logger.warning(f"Lecture impossible {article_path.name} : {e}")
+                continue
+
+            if post.metadata.get("wiki_compiled") and not force:
+                logger.debug(f"Ignoré (déjà compilé) : {article_path.name}")
+                continue
+
+            content = post.content or ""
+            if not content.strip():
+                logger.warning(f"Article vide, ignoré : {article_path.name}")
+                continue
+
+            title = str(post.metadata.get("title", article_path.stem))
+            pending.append((article_path, title, content))
+
+        if not pending:
+            logger.info("Aucun article à compiler.")
+            return BatchCompilationResult()
+
+        logger.info(f"Batch API : {len(pending)} articles à compiler (source={source})")
+
+        # 2. Construire les requêtes inline
+        inline_requests: list[dict] = []
+        for article_path, title, content in pending:
+            prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:MAX_ARTICLE_CHARS])
+            inline_requests.append(
+                {
+                    "key": article_path.stem,
+                    "request": {
+                        "contents": [{"parts": [{"text": prompt}]}],
+                    },
+                }
+            )
+
+        # 3. Soumettre le batch job
+        api_key = self._settings.get_gemini_api_key()
+        client = genai.Client(api_key=api_key)
+
+        logger.info(f"Soumission batch job ({len(inline_requests)} requêtes)...")
+        batch_job = client.batches.create(
+            model=self.model_name,
+            src=inline_requests,
+            config={"display_name": f"wiki-compile-{source}-{int(time.time())}"},
+        )
+        job_name = batch_job.name
+        logger.info(f"Batch job soumis : {job_name}")
+        logger.info(f"État initial : {batch_job.state.name}")
+
+        # 4. Poller jusqu'à completion
+        logger.info(f"Polling toutes les {BATCH_POLL_INTERVAL_S}s...")
+        while batch_job.state.name not in BATCH_COMPLETED_STATES:
+            time.sleep(BATCH_POLL_INTERVAL_S)
+            batch_job = client.batches.get(name=job_name)
+            logger.info(f"  État : {batch_job.state.name}")
+
+        if batch_job.state.name != "JOB_STATE_SUCCEEDED":
+            error_msg = str(batch_job.error) if batch_job.error else "raison inconnue"
+            raise RuntimeError(f"Batch job échoué ({batch_job.state.name}) : {error_msg}")
+
+        logger.info("Batch job complété avec succès. Traitement des résultats...")
+
+        # 5. Récupérer et traiter les résultats
+        # Construire un index stem → (path, title) pour retrouver les articles
+        article_index: dict[str, tuple[Path, str]] = {
+            path.stem: (path, title) for path, title, _ in pending
+        }
+
+        batch_result = BatchCompilationResult()
+
+        # Récupérer les réponses inline
+        responses = batch_job.dest.inlined_responses if batch_job.dest else []
+        if not responses:
+            logger.warning("Aucune réponse inline trouvée dans le batch job.")
+            return batch_result
+
+        for i, inline_response in enumerate(responses):
+            key = inline_response.key if hasattr(inline_response, "key") else str(i)
+            article_path, article_title = article_index.get(key, (Path(f"unknown/{key}"), key))
+            result = CompilationResult(article_path=article_path, article_title=article_title)
+
+            # Vérifier les erreurs
+            if hasattr(inline_response, "error") and inline_response.error:
+                result.errors.append(f"Batch API error : {inline_response.error}")
+                batch_result.results.append(result)
+                continue
+
+            # Extraire le texte de la réponse
+            try:
+                if hasattr(inline_response, "response") and inline_response.response:
+                    raw_text = inline_response.response.text
+                else:
+                    result.errors.append("Réponse vide du batch API")
+                    batch_result.results.append(result)
+                    continue
+            except AttributeError:
+                result.errors.append("Format de réponse inattendu")
+                batch_result.results.append(result)
+                continue
+
+            # Parser et traiter (même logique que compile_article)
+            self._process_extraction_result(
+                raw_text=raw_text,
+                raw_path=article_path,
+                article_title=article_title,
+                result=result,
+            )
+            batch_result.results.append(result)
+
+        # 6. Persister cache + index + log
+        if batch_result.total_compiled > 0:
+            if rebuild_index:
+                try:
+                    self.indexer.build_master_index()
+                except Exception as e:
+                    logger.error(f"Erreur génération index : {e}")
+
+            self.cache.save()
+
+            try:
+                append_log_entry(
+                    vault_path=self.vault_path,
+                    operation="compile-batch",
+                    title=f"Batch API {batch_result.total_compiled} articles",
+                    details={
+                        "Source": source,
+                        "Fiches créées": batch_result.total_concepts_created,
+                        "Fiches mises à jour": batch_result.total_concepts_updated,
+                        "Erreurs": batch_result.total_errors,
+                        "Mode": "batch-api",
+                    },
+                )
+            except OSError as e:
+                logger.warning(f"Impossible d'écrire dans log.md : {e}")
+
+        logger.info(batch_result.summary())
+        return batch_result
+
+    def poll_batch_job(
+        self,
+        job_name: str,
+        *,
+        rebuild_index: bool = True,
+    ) -> BatchCompilationResult:
+        """Récupère les résultats d'un batch job existant et les traite.
+
+        Utile pour reprendre un job soumis précédemment sans le re-soumettre.
+
+        Args:
+            job_name: Nom du batch job (obtenu lors de la soumission).
+            rebuild_index: Si True, régénère l'index maître à la fin.
+
+        Returns:
+            BatchCompilationResult avec l'agrégat des résultats.
+
+        Raises:
+            RuntimeError: Si le job n'est pas dans un état terminal réussi.
+        """
+        try:
+            from google import genai
+        except ImportError as e:
+            raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
+
+        api_key = self._settings.get_gemini_api_key()
+        client = genai.Client(api_key=api_key)
+
+        batch_job = client.batches.get(name=job_name)
+        logger.info(f"Batch job {job_name} : état = {batch_job.state.name}")
+
+        if batch_job.state.name not in BATCH_COMPLETED_STATES:
+            logger.info(f"Job non terminé, polling...")
+            while batch_job.state.name not in BATCH_COMPLETED_STATES:
+                time.sleep(BATCH_POLL_INTERVAL_S)
+                batch_job = client.batches.get(name=job_name)
+                logger.info(f"  État : {batch_job.state.name}")
+
+        if batch_job.state.name != "JOB_STATE_SUCCEEDED":
+            error_msg = str(batch_job.error) if batch_job.error else "raison inconnue"
+            raise RuntimeError(f"Batch job échoué ({batch_job.state.name}) : {error_msg}")
+
+        logger.info("Batch job complété. Traitement des résultats...")
+
+        # Collecter tous les articles pour l'index
+        articles = self._collect_articles("all")
+        article_index: dict[str, tuple[Path, str]] = {}
+        for article_path in articles:
+            try:
+                post = frontmatter.load(str(article_path))
+                title = str(post.metadata.get("title", article_path.stem))
+                article_index[article_path.stem] = (article_path, title)
+            except Exception:
+                article_index[article_path.stem] = (article_path, article_path.stem)
+
+        batch_result = BatchCompilationResult()
+        responses = batch_job.dest.inlined_responses if batch_job.dest else []
+
+        for i, inline_response in enumerate(responses):
+            key = inline_response.key if hasattr(inline_response, "key") else str(i)
+            article_path, article_title = article_index.get(key, (Path(f"unknown/{key}"), key))
+            result = CompilationResult(article_path=article_path, article_title=article_title)
+
+            if hasattr(inline_response, "error") and inline_response.error:
+                result.errors.append(f"Batch API error : {inline_response.error}")
+                batch_result.results.append(result)
+                continue
+
+            try:
+                if hasattr(inline_response, "response") and inline_response.response:
+                    raw_text = inline_response.response.text
+                else:
+                    result.errors.append("Réponse vide du batch API")
+                    batch_result.results.append(result)
+                    continue
+            except AttributeError:
+                result.errors.append("Format de réponse inattendu")
+                batch_result.results.append(result)
+                continue
+
+            self._process_extraction_result(
+                raw_text=raw_text,
+                raw_path=article_path,
+                article_title=article_title,
+                result=result,
+            )
+            batch_result.results.append(result)
+
+        if batch_result.total_compiled > 0:
+            if rebuild_index:
+                try:
+                    self.indexer.build_master_index()
+                except Exception as e:
+                    logger.error(f"Erreur génération index : {e}")
+
+            self.cache.save()
+
+            try:
+                append_log_entry(
+                    vault_path=self.vault_path,
+                    operation="compile-batch-poll",
+                    title=f"Poll batch {batch_result.total_compiled} articles",
+                    details={
+                        "Job": job_name,
+                        "Fiches créées": batch_result.total_concepts_created,
+                        "Fiches mises à jour": batch_result.total_concepts_updated,
+                        "Erreurs": batch_result.total_errors,
+                    },
+                )
+            except OSError as e:
+                logger.warning(f"Impossible d'écrire dans log.md : {e}")
+
+        logger.info(batch_result.summary())
+        return batch_result
+
+    def _process_extraction_result(
+        self,
+        raw_text: str,
+        raw_path: Path,
+        article_title: str,
+        result: CompilationResult,
+    ) -> None:
+        """Traite le résultat d'une extraction Gemini (commun aux deux modes).
+
+        Parse la réponse YAML, crée/met à jour les fiches, ajoute les
+        backlinks et marque l'article comme compilé.
+
+        Args:
+            raw_text: Texte brut retourné par le LLM.
+            raw_path: Chemin du fichier article dans 00_RAW/.
+            article_title: Titre de l'article.
+            result: CompilationResult à remplir.
+        """
+        knowledge = _parse_gemini_response(raw_text)
+
+        if knowledge.is_empty():
+            logger.warning(
+                f"Réponse vide/invalide pour {raw_path.name}. Brut (500 chars) : {raw_text[:500]!r}"
+            )
+            result.errors.append("Aucune connaissance extraite (réponse vide ou invalide)")
+            return
+
+        logger.info(
+            f"Extrait : {len(knowledge.concepts)} concepts, "
+            f"{len(knowledge.people)} personnes, "
+            f"{len(knowledge.technologies)} techs, "
+            f"{len(knowledge.topics)} topics"
+        )
+
+        source_stem = raw_path.stem
+        source_title = article_title
+        all_concept_names: list[str] = []
+
+        # Traitement des concepts
+        for concept_data in knowledge.concepts:
+            try:
+                _, created = self.concept_manager.create_or_update_concept(
+                    concept_data, source_stem, source_title
+                )
+                if created:
+                    result.concepts_created += 1
+                else:
+                    result.concepts_updated += 1
+                all_concept_names.append(concept_data.name)
+            except Exception as e:
+                logger.error(f"Concept '{concept_data.name}' : {e}")
+                result.errors.append(f"Concept '{concept_data.name}' : {e}")
+
+        # Traitement des personnes
+        for person_data in knowledge.people:
+            try:
+                _, created = self.concept_manager.create_or_update_person(
+                    person_data, source_stem, source_title
+                )
+                if created:
+                    result.concepts_created += 1
+                else:
+                    result.concepts_updated += 1
+                all_concept_names.append(person_data.name)
+            except Exception as e:
+                logger.error(f"Personne '{person_data.name}' : {e}")
+                result.errors.append(f"Personne '{person_data.name}' : {e}")
+
+        # Traitement des technologies
+        for tech_data in knowledge.technologies:
+            try:
+                _, created = self.concept_manager.create_or_update_technology(
+                    tech_data, source_stem, source_title
+                )
+                if created:
+                    result.concepts_created += 1
+                else:
+                    result.concepts_updated += 1
+                all_concept_names.append(tech_data.name)
+            except Exception as e:
+                logger.error(f"Tech '{tech_data.name}' : {e}")
+                result.errors.append(f"Tech '{tech_data.name}' : {e}")
+
+        # Traitement des topics
+        for topic_data in knowledge.topics:
+            try:
+                path, created = self.concept_manager.create_or_update_topic(
+                    topic_data, source_stem, source_title
+                )
+                if created:
+                    result.concepts_created += 1
+                else:
+                    result.concepts_updated += 1
+                all_concept_names.append(topic_data.name)
+                if topic_data.related and path:
+                    self.linker.add_related_concepts(path, topic_data.related)
+            except Exception as e:
+                logger.error(f"Topic '{topic_data.name}' : {e}")
+                result.errors.append(f"Topic '{topic_data.name}' : {e}")
+
+        # Backlinks : article → concepts
+        if all_concept_names:
+            added = self.linker.add_concepts_to_article(raw_path, all_concept_names)
+            result.backlinks_created = added
+
+        # Marquer l'article comme compilé dans le frontmatter
+        try:
+            post = frontmatter.load(str(raw_path))
+            self._mark_compiled(raw_path, post, knowledge)
+        except Exception as e:
+            logger.warning(f"Impossible de marquer {raw_path.name} comme compilé : {e}")
+
+        # Mettre à jour le cache
+        self.cache.set_article_state(
+            raw_path,
+            wiki_compiled=True,
+            concepts=all_concept_names,
+        )
+        for concept_name in all_concept_names:
+            self.cache.add_backlink(concept_name, source_stem)
+
+        logger.info(
+            f"✅ {raw_path.name} : "
+            f"{result.concepts_created} créés, "
+            f"{result.concepts_updated} mis à jour, "
+            f"{result.backlinks_created} liens"
+        )
 
     def get_compilation_stats(self) -> dict:
         """Retourne les statistiques de compilation du vault.

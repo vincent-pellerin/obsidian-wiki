@@ -6,6 +6,9 @@ Usage:
     uv run python scripts/compile_wiki.py --source substack --limit 5
     uv run python scripts/compile_wiki.py --force
     uv run python scripts/compile_wiki.py --stats
+    uv run python scripts/compile_wiki.py --batch
+    uv run python scripts/compile_wiki.py --batch --source medium --limit 100
+    uv run python scripts/compile_wiki.py --batch-poll JOB_NAME
 """
 
 import argparse
@@ -28,12 +31,22 @@ from src.wiki.models import BatchCompilationResult
 console = Console()
 
 # Prix par million de tokens (input, output) pour chaque modèle connu
+# Standard pricing
 _MODEL_PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash-lite": (0.10, 0.40),
     "gemini-2.5-flash": (0.15, 0.60),
     "gemini-2.5-pro": (1.25, 5.00),
     "gemini-2.0-flash-lite": (0.075, 0.30),
     "gemini-2.0-flash": (0.10, 0.40),
+}
+
+# Batch API pricing (50% discount)
+_MODEL_BATCH_PRICING: dict[str, tuple[float, float]] = {
+    "gemini-2.5-flash-lite": (0.05, 0.20),
+    "gemini-2.5-flash": (0.075, 0.30),
+    "gemini-2.5-pro": (0.625, 2.50),
+    "gemini-2.0-flash-lite": (0.0375, 0.15),
+    "gemini-2.0-flash": (0.05, 0.20),
 }
 
 
@@ -97,28 +110,34 @@ def cmd_stats(compiler: WikiCompiler) -> None:
     console.print(table)
 
 
-def _get_model_pricing(model_name: str) -> tuple[float, float] | None:
+def _get_model_pricing(model_name: str, batch: bool = False) -> tuple[float, float] | None:
     """Retourne le prix (input, output) par million de tokens pour un modèle.
 
     Args:
         model_name: Identifiant du modèle Gemini.
+        batch: Si True, retourne les prix Batch API (50% réduction).
 
     Returns:
         Tuple (prix_input, prix_output) ou None si modèle inconnu.
     """
-    for key, prices in _MODEL_PRICING.items():
+    pricing_table = _MODEL_BATCH_PRICING if batch else _MODEL_PRICING
+    for key, prices in pricing_table.items():
         if key in model_name:
             return prices
     return None
 
 
-def print_batch_result(result: BatchCompilationResult, model_name: str) -> None:
+def print_batch_result(
+    result: BatchCompilationResult, model_name: str, batch: bool = False
+) -> None:
     """Affiche le résumé d'un batch de compilation.
 
     Args:
         result: Résultat du batch.
         model_name: Nom du modèle utilisé (pour le calcul de coût réel).
+        batch: Si True, utilise les prix Batch API.
     """
+    mode_label = "Batch API" if batch else "Standard"
     # Tableau récapitulatif
     table = Table(title="Résultat de compilation", show_header=True, header_style="bold")
     table.add_column("Métrique")
@@ -136,8 +155,12 @@ def print_batch_result(result: BatchCompilationResult, model_name: str) -> None:
     # Tableau coût réel (si tokens capturés via usage_metadata)
     total_tokens = result.total_input_tokens + result.total_output_tokens
     if total_tokens > 0:
-        pricing = _get_model_pricing(model_name)
-        cost_table = Table(title="Coût API réel", show_header=True, header_style="bold magenta")
+        pricing = _get_model_pricing(model_name, batch=batch)
+        cost_table = Table(
+            title=f"Coût API réel ({mode_label})",
+            show_header=True,
+            header_style="bold magenta",
+        )
         cost_table.add_column("Métrique")
         cost_table.add_column("Valeur", justify="right")
 
@@ -188,6 +211,9 @@ Exemples:
   uv run python scripts/compile_wiki.py --stats
   uv run python scripts/compile_wiki.py --source medium --limit 10
   uv run python scripts/compile_wiki.py --source all --force
+  uv run python scripts/compile_wiki.py --batch
+  uv run python scripts/compile_wiki.py --batch --source medium --limit 100
+  uv run python scripts/compile_wiki.py --batch-poll jobs/123456
         """,
     )
     parser.add_argument(
@@ -228,6 +254,18 @@ Exemples:
             "Prend la priorité sur GEMINI_MODEL_WIKI dans .env"
         ),
     )
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Utiliser la Gemini Batch API (50%% moins cher, asynchrone)",
+    )
+    parser.add_argument(
+        "--batch-poll",
+        type=str,
+        default=None,
+        metavar="JOB_NAME",
+        help="Récupérer les résultats d'un batch job existant",
+    )
     return parser.parse_args()
 
 
@@ -248,6 +286,9 @@ def main() -> int:
         console.print("Ajoutez GEMINI_API_KEY ou GOOGLE_API_KEY dans .env ou ~/.zshenv")
         return 1
 
+    is_batch = args.batch or args.batch_poll
+    mode_label = "Batch API" if is_batch else "Standard"
+
     console.print("[bold]🧠 obsidian-wiki — Compilation[/bold]")
     console.print(f"[dim]Vault : {settings.get_vault_path()}[/dim]")
 
@@ -257,7 +298,7 @@ def main() -> int:
         if args.model
         else effective_model
     )
-    console.print(f"[dim]Modèle : {model_label}[/dim]")
+    console.print(f"[dim]Modèle : {model_label} | Mode : {mode_label}[/dim]")
 
     compiler = WikiCompiler(model_override=args.model)
 
@@ -266,10 +307,33 @@ def main() -> int:
         cmd_stats(compiler)
         return 0
 
+    # Mode poll d'un batch job existant
+    if args.batch_poll:
+        console.print(f"[dim]Poll batch job : {args.batch_poll}[/dim]\n")
+        try:
+            result = compiler.poll_batch_job(
+                job_name=args.batch_poll,
+                rebuild_index=not args.no_index,
+            )
+        except RuntimeError as e:
+            console.print(f"[bold red]❌ Erreur : {e}[/bold red]")
+            return 1
+
+        print_batch_result(result, effective_model, batch=True)
+        if result.total_errors == 0:
+            console.print("\n[bold green]✅ Compilation batch terminée.[/bold green]")
+            return 0
+        else:
+            console.print(
+                f"\n[bold yellow]⚠️  Terminé avec {result.total_errors} erreur(s).[/bold yellow]"
+            )
+            return 1
+
     console.print(
         f"[dim]Source : {args.source} | "
         f"Limit : {args.limit or 'aucune'} | "
-        f"Force : {args.force}[/dim]\n"
+        f"Force : {args.force} | "
+        f"Mode : {mode_label}[/dim]\n"
     )
 
     # Compilation
@@ -281,17 +345,32 @@ def main() -> int:
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Compilation en cours...", total=None)
-
-        result = compiler.batch_compile(
-            source=args.source,
-            limit=args.limit,
-            force=args.force,
-            rebuild_index=not args.no_index,
+        task = progress.add_task(
+            f"Compilation {mode_label} en cours...",
+            total=None,
         )
+
+        if args.batch:
+            try:
+                result = compiler.batch_compile_api(
+                    source=args.source,
+                    limit=args.limit,
+                    force=args.force,
+                    rebuild_index=not args.no_index,
+                )
+            except RuntimeError as e:
+                console.print(f"[bold red]❌ Erreur batch : {e}[/bold red]")
+                return 1
+        else:
+            result = compiler.batch_compile(
+                source=args.source,
+                limit=args.limit,
+                force=args.force,
+                rebuild_index=not args.no_index,
+            )
         progress.update(task, completed=True)
 
-    print_batch_result(result, effective_model)
+    print_batch_result(result, effective_model, batch=is_batch)
 
     if result.total_errors == 0:
         console.print("\n[bold green]✅ Compilation terminée.[/bold green]")

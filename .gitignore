@@ -47,6 +47,7 @@ logs/
 
 # Temp files
 .tmp/
+TODO.md
 
 # OpenCode
 .opencode/
