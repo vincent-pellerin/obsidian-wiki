@@ -6,7 +6,6 @@ Dataclasses utilisées par compiler, concept_manager, linker et indexer.
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # Données extraites par le LLM
 # ---------------------------------------------------------------------------
@@ -115,6 +114,8 @@ class CompilationResult:
         backlinks_created: Nombre de backlinks ajoutés.
         skipped: True si l'article a été ignoré (déjà compilé).
         errors: Liste des messages d'erreur rencontrés.
+        input_tokens: Tokens en entrée consommés (usage_metadata Gemini).
+        output_tokens: Tokens en sortie consommés (usage_metadata Gemini).
     """
 
     article_path: Path
@@ -124,6 +125,8 @@ class CompilationResult:
     backlinks_created: int = 0
     skipped: bool = False
     errors: list[str] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     @property
     def success(self) -> bool:
@@ -145,6 +148,16 @@ class BatchCompilationResult:
     """
 
     results: list[CompilationResult] = field(default_factory=list)
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Total des tokens en entrée consommés."""
+        return sum(r.input_tokens for r in self.results)
+
+    @property
+    def total_output_tokens(self) -> int:
+        """Total des tokens en sortie consommés."""
+        return sum(r.output_tokens for r in self.results)
 
     @property
     def total_articles(self) -> int:

@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 from src.config import get_settings
+from src.wiki.cache import WikiStateCache
 
 logger = logging.getLogger(__name__)
 
@@ -18,18 +19,27 @@ logger = logging.getLogger(__name__)
 class Linker:
     """Gère les backlinks bidirectionnels dans le vault Obsidian.
 
+    Utilise un cache persistant (WikiStateCache) pour les lookups de
+    backlinks en O(1) au lieu de scanner tout le wiki à chaque requête.
+
     Attributes:
         vault_path: Chemin racine du vault Obsidian.
         wiki_root: Chemin vers 02_WIKI/.
         raw_root: Chemin vers 00_RAW/.
+        cache: Cache persistant pour les index inversés.
     """
 
-    def __init__(self) -> None:
-        """Initialise avec la configuration courante."""
+    def __init__(self, cache: WikiStateCache | None = None) -> None:
+        """Initialise avec la configuration courante et un cache optionnel.
+
+        Args:
+            cache: Instance de WikiStateCache partagée. Si None, en crée une.
+        """
         settings = get_settings()
         self.vault_path = Path(settings.get_vault_path())
         self.wiki_root = self.vault_path / "02_WIKI"
         self.raw_root = self.vault_path / "00_RAW"
+        self.cache = cache or WikiStateCache(self.vault_path)
 
     def add_concepts_to_article(
         self,
@@ -150,16 +160,31 @@ class Linker:
     def get_backlinks(self, article_stem: str) -> list[Path]:
         """Retourne les fiches wiki qui référencent un article donné.
 
+        Utilise l'index inversé du cache en O(1) au lieu de scanner
+        tous les fichiers wiki.
+
         Args:
             article_stem: Nom du fichier article sans extension.
 
         Returns:
             Liste des chemins de fiches wiki contenant [[article_stem]].
         """
+        # Essayer le cache d'abord (O(1))
+        cached_stems = self.cache.get_backlinks(article_stem)
+        if cached_stems:
+            backlinks: list[Path] = []
+            for stem in cached_stems:
+                fiche_path = self.cache.get_fiche_path(stem)
+                if fiche_path and fiche_path.exists():
+                    backlinks.append(fiche_path)
+            if backlinks:
+                return backlinks
+
+        # Fallback : scan classique si le cache est vide ou désynchronisé
         if not self.wiki_root.exists():
             return []
 
-        backlinks: list[Path] = []
+        backlinks = []
         search_pattern = f"[[{article_stem}]]"
 
         for wiki_file in self.wiki_root.rglob("*.md"):
@@ -167,6 +192,8 @@ class Linker:
                 content = wiki_file.read_text(encoding="utf-8")
                 if search_pattern in content:
                     backlinks.append(wiki_file)
+                    # Alimenter le cache au passage
+                    self.cache.add_backlink(wiki_file.stem, article_stem)
             except OSError as e:
                 logger.warning(f"Impossible de lire {wiki_file}: {e}")
 

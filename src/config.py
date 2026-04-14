@@ -15,7 +15,6 @@ class Settings(BaseSettings):
         gemini_model_wiki: Modèle Gemini pour la compilation wiki.
         medium_extract_output: Répertoire de sortie medium_extract.
         substack_extract_output: Répertoire de sortie substack_extract.
-        enable_semantic_search: Activer la recherche sémantique.
         log_level: Niveau de logging (DEBUG, INFO, WARNING, ERROR).
     """
 
@@ -58,9 +57,6 @@ class Settings(BaseSettings):
     # Bridges
     medium_extract_output: str = "/home/vincent/dev/medium_extract/output"
     substack_extract_output: str = "/home/vincent/dev/substack_extract/output"
-
-    # Features
-    enable_semantic_search: bool = False
 
     # Logging
     log_level: str = "INFO"

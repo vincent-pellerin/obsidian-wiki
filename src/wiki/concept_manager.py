@@ -3,16 +3,22 @@
 Gère le CRUD des fichiers markdown dans 02_WIKI/{Concepts,People,Technologies,Topics}.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import frontmatter
 import yaml
 
 from src.config import get_settings
 from src.wiki.models import ConceptData, PersonData, TechData, TopicData
+
+if TYPE_CHECKING:
+    from src.wiki.cache import WikiStateCache
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +38,31 @@ def _sanitize_filename(name: str) -> str:
         name: Nom du concept (ex: "GraphRAG", "John Doe").
 
     Returns:
-        Nom de fichier sûr sans caractères spéciaux.
+        Nom de fichier sûr sans caractères spéciaux, normalisé en PascalCase.
 
     Example:
         >>> _sanitize_filename("Graph RAG / Knowledge")
         'Graph_RAG_Knowledge'
+        >>> _sanitize_filename("AI inflation")
+        'AI_Inflation'
     """
     # Remplace les caractères non alphanumériques (sauf tirets) par _
     safe = re.sub(r"[^\w\s\-]", "", name, flags=re.UNICODE)
     safe = re.sub(r"[\s]+", "_", safe.strip())
-    return safe
+
+    # Normaliser la casse : PascalCase (première lettre de chaque mot en majuscule)
+    # Gérer les acronymes comme AI, API, etc. en les gardant en majuscules
+    words = safe.split("_")
+    normalized_words = []
+    for word in words:
+        if len(word) <= 2 and word.isupper():
+            # Garder les acronymes courts en majuscules (AI, API, IP, etc.)
+            normalized_words.append(word)
+        else:
+            # PascalCase pour les autres mots
+            normalized_words.append(word.capitalize())
+
+    return "_".join(normalized_words)
 
 
 def _wiki_dir_for_type(wiki_root: Path, wiki_type: str) -> Path:
@@ -160,14 +181,85 @@ class ConceptManager:
     Crée ou met à jour les fichiers markdown des concepts, personnes,
     technologies et topics dans les sous-dossiers appropriés du vault.
 
+    Maintient un index en mémoire (stem → Path, title → Path) pour
+    des lookups O(1) au lieu de scans répétés du répertoire.
+
     Attributes:
         wiki_root: Chemin vers 02_WIKI/ dans le vault.
+        cache: Cache persistant partagé (optionnel).
     """
 
-    def __init__(self) -> None:
-        """Initialise avec la configuration courante."""
+    def __init__(self, cache: WikiStateCache | None = None) -> None:
+        """Initialise avec la configuration courante et un cache optionnel.
+
+        Args:
+            cache: Instance de WikiStateCache partagée pour les lookups rapides.
+        """
         settings = get_settings()
         self.wiki_root = Path(settings.get_vault_path()) / "02_WIKI"
+        self._cache = cache
+        self._stem_index: dict[str, Path] = {}
+        self._title_index: dict[str, Path] = {}
+        self._build_memory_index()
+
+    def _build_memory_index(self) -> None:
+        """Construit l'index en mémoire stem→Path et title→Path.
+
+        Scanne le répertoire wiki une seule fois au démarrage pour
+        indexer tous les fichiers. Les lookups suivants sont en O(1).
+        """
+        if not self.wiki_root.exists():
+            return
+
+        for md_file in self.wiki_root.rglob("*.md"):
+            if md_file.stem.startswith("000_"):
+                continue
+            stem_lower = md_file.stem.lower()
+            self._stem_index[stem_lower] = md_file
+            # Aussi indexer par titre si disponible dans le cache
+            if self._cache:
+                state = self._cache.get_fiche_state(md_file.stem)
+                if state and state.get("title"):
+                    self._title_index[state["title"].lower()] = md_file
+
+    def find_fiche_by_name(self, name: str) -> Path | None:
+        """Recherche une fiche par nom (stem ou titre) en O(1).
+
+        Args:
+            name: Nom du concept, stem du fichier ou titre.
+
+        Returns:
+            Chemin de la fiche trouvée, ou None si introuvable.
+        """
+        # Recherche par stem (exact, case-insensitive)
+        name_lower = name.lower()
+        result = self._stem_index.get(name_lower)
+        if result and result.exists():
+            return result
+
+        # Recherche par stem sanitisé
+        sanitized_lower = _sanitize_filename(name).lower()
+        result = self._stem_index.get(sanitized_lower)
+        if result and result.exists():
+            return result
+
+        # Recherche par titre
+        result = self._title_index.get(name_lower)
+        if result and result.exists():
+            return result
+
+        return None
+
+    def _register_in_index(self, file_path: Path, title: str = "") -> None:
+        """Enregistre une fiche dans l'index en mémoire.
+
+        Args:
+            file_path: Chemin de la fiche à indexer.
+            title: Titre de la fiche (optionnel).
+        """
+        self._stem_index[file_path.stem.lower()] = file_path
+        if title:
+            self._title_index[title.lower()] = file_path
 
     def create_or_update_concept(
         self,
@@ -358,12 +450,32 @@ class ConceptManager:
             )
             file_path.write_text(content, encoding="utf-8")
             logger.info(f"Fiche créée : {file_path.relative_to(self.wiki_root)}")
+
+            # Mettre à jour les index
+            self._register_in_index(file_path, title=name)
+            if self._cache:
+                self._cache.set_fiche_state(
+                    file_path,
+                    wiki_type=wiki_type,
+                    source_count=1,
+                    title=name,
+                )
             return file_path, True
 
         # Mise à jour : ajouter la source si pas déjà présente
         updated = self._add_source_to_existing(file_path, source_stem, source_title)
         if updated:
             logger.info(f"Fiche mise à jour : {file_path.name} (+source {source_stem})")
+            # Mettre à jour le cache avec le nouveau source_count
+            if self._cache:
+                state = self._cache.get_fiche_state(file_path.stem)
+                current_count = state["source_count"] if state else 1
+                self._cache.set_fiche_state(
+                    file_path,
+                    wiki_type=wiki_type,
+                    source_count=current_count + 1,
+                    title=name,
+                )
         else:
             logger.debug(f"Fiche déjà à jour : {file_path.name}")
         return file_path, False

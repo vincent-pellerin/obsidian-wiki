@@ -26,7 +26,7 @@ Les deux projets partagent le même vault Obsidian via **Syncthing** (VPS → lo
 - **Wiki Compiler** : transformation des articles bruts en fiches concepts structurées
 - **Q&A Engine** : réponses basées sur le wiki avec citations de sources
 - **Health Checker** : détection des liens cassés, concepts orphelins, doublons
-- **Search** : recherche full-text (et sémantique optionnelle) dans le vault
+- **Search** : recherche full-text via [qmd](https://github.com/tobi/qmd) (BM25 + hybride)
 - **Generators** : rapports Markdown, présentations Marp, graphiques de concepts
 
 ---
@@ -57,15 +57,10 @@ obsidian-wiki/
 │   │   ├── slide_generator.py  # Présentations Marp
 │   │   └── graph_generator.py  # Visualisations réseau
 │   │
-│   ├── lint/                   # Health checker
-│   │   ├── __init__.py
-│   │   ├── health_checker.py   # Vérifications qualité wiki
-│   │   └── enricher.py         # Enrichissement automatique
-│   │
-│   └── search/                 # Moteur de recherche
+│   └── lint/                   # Health checker
 │       ├── __init__.py
-│       ├── local_search.py     # Recherche full-text
-│       └── semantic_search.py  # Recherche sémantique (optionnel)
+│       ├── health_checker.py   # Vérifications qualité wiki
+│       └── enricher.py         # Enrichissement automatique
 │
 ├── scripts/                    # Scripts CLI autonomes
 │   ├── ingest_all.py           # Lance tous les bridges
@@ -81,6 +76,11 @@ obsidian-wiki/
 ├── pyproject.toml
 ├── .env.example
 └── README.md
+
+# Outil externe (binaire système, pas une dépendance Python)
+# qmd — https://github.com/tobi/qmd
+#   CLI : qmd search "query" -c wiki
+#   MCP : qmd mcp (serveur MCP natif)
 ```
 
 ---
@@ -125,20 +125,27 @@ ssh vps_new
 # Emplacement du projet
 cd ~/dev/obsidian-wiki/
 
-# Installation des dépendances
+# Installation des dépendances Python
 uv sync
 
-# Lancer l'ingestion
+# --- Phase 1 : Ingestion ---
 uv run python scripts/ingest_all.py
 
-# Compiler le wiki
+# --- Phase 2 : Compilation ---
 uv run python scripts/compile_wiki.py
 
-# Q&A
+# Mettre à jour l'index qmd après compilation
+qmd update
+
+# --- Phase 3 : Q&A ---
 uv run python scripts/ask_wiki.py "Qu'est-ce que GraphRAG ?"
 
-# Health check
+# --- Phase 4 : Health Check ---
 uv run python scripts/lint_wiki.py --report
+
+# --- Phase 5 : Recherche via qmd ---
+qmd search "RAG" -c wiki -n 10           # Recherche rapide (BM25)
+qmd query "comment déployer" -c wiki     # Recherche hybride (meilleure qualité)
 ```
 
 ---
@@ -164,9 +171,28 @@ Nouvelles commandes disponibles : `/ingest` `/compile` `/ask` `/report` `/slides
 # .env (copier depuis .env.example)
 VAULT_PATH=/home/vincent/obsidian-second-brain-vps
 GEMINI_API_KEY=...
-GEMINI_MODEL_WIKI=gemini-2.5-flash-preview-05-20
-ENABLE_SEMANTIC_SEARCH=false
+GEMINI_MODEL_WIKI=gemini-2.5-flash
 ```
+
+### Dépendances système
+
+Le projet utilise **qmd** comme moteur de recherche externe (binaire Node.js, non une dépendance Python) :
+
+```bash
+# Installation sur le VPS
+npm install -g @tobilu/qmd
+
+# Configuration initiale (à faire une fois)
+qmd collection add /home/vincent/obsidian-second-brain-vps/02_WIKI --name wiki
+
+# Mise à jour de l'index après compilation
+qmd update
+```
+
+**Architecture de la recherche :**
+- `qmd search` — Recherche BM25 full-text (rapide)
+- `qmd query` — Recherche hybride BM25 + vectoriel + reranking (meilleure qualité)
+- Index stocké dans `~/.cache/qmd/index.sqlite`
 
 ---
 

@@ -86,7 +86,7 @@ class MediumBridge:
         self.dest_dir.mkdir(parents=True, exist_ok=True)
         result = SyncResult()
 
-        markdown_files = list(self.source_dir.glob("*.md"))
+        markdown_files = list(self.source_dir.rglob("*.md"))
         logger.info(f"MediumBridge: {len(markdown_files)} fichiers trouvés dans {self.source_dir}")
 
         for source_file in markdown_files:

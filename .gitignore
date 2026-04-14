@@ -42,5 +42,14 @@ Thumbs.db
 *.log
 logs/
 
+# Wiki cache (generated, vault-specific)
+.wiki_state.json
+
+# Temp files
+.tmp/
+
+# OpenCode
+.opencode/
+
 # uv
 uv.lock

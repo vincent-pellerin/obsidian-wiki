@@ -17,6 +17,7 @@ import frontmatter
 import yaml
 
 from src.config import get_settings
+from src.wiki.cache import WikiStateCache
 from src.wiki.concept_manager import ConceptManager
 from src.wiki.indexer import Indexer
 from src.wiki.linker import Linker
@@ -166,7 +167,7 @@ def _parse_gemini_response(raw_text: str) -> ExtractedKnowledge:
     return knowledge
 
 
-def _call_gemini(content: str, model_name: str, api_key: str) -> str:
+def _call_gemini(content: str, model_name: str, api_key: str) -> tuple[str, int, int]:
     """Appelle l'API Gemini pour extraire les concepts d'un article.
 
     Args:
@@ -175,7 +176,7 @@ def _call_gemini(content: str, model_name: str, api_key: str) -> str:
         api_key: Clé API Gemini.
 
     Returns:
-        Texte brut de la réponse Gemini.
+        Tuple (texte_réponse, input_tokens, output_tokens).
 
     Raises:
         RuntimeError: Si toutes les tentatives ont échoué.
@@ -192,7 +193,12 @@ def _call_gemini(content: str, model_name: str, api_key: str) -> str:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = client.models.generate_content(model=model_name, contents=prompt)
-            return response.text
+            input_tokens = 0
+            output_tokens = 0
+            if response.usage_metadata:
+                input_tokens = response.usage_metadata.prompt_token_count or 0
+                output_tokens = response.usage_metadata.candidates_token_count or 0
+            return response.text, input_tokens, output_tokens
         except Exception as e:
             last_error = e
             if attempt < MAX_RETRIES:
@@ -218,16 +224,36 @@ class WikiCompiler:
         linker: Gestion des backlinks.
         indexer: Génération de l'index maître.
         vault_path: Chemin racine du vault.
+        model_name: Nom du modèle Gemini utilisé.
     """
 
-    def __init__(self) -> None:
-        """Initialise le compilateur avec la configuration courante."""
+    def __init__(self, model_override: str | None = None) -> None:
+        """Initialise le compilateur avec la configuration courante.
+
+        Args:
+            model_override: Nom de modèle Gemini à utiliser à la place de
+                celui défini dans la configuration (utile pour les tests).
+        """
         settings = get_settings()
-        self.concept_manager = ConceptManager()
-        self.linker = Linker()
-        self.indexer = Indexer()
         self.vault_path = Path(settings.get_vault_path())
         self._settings = settings
+        self.model_name = model_override or settings.gemini_model_wiki
+        self.cache = WikiStateCache(self.vault_path)
+
+        # Reconstruction automatique du cache au premier lancement
+        if self.cache.is_empty():
+            logger.info("Premier lancement : reconstruction du cache wiki...")
+            self.cache.rebuild_all()
+
+        # Partager le cache avec les sous-composants
+        self.concept_manager = ConceptManager(cache=self.cache)
+        self.linker = Linker(cache=self.cache)
+        self.indexer = Indexer()
+
+        if model_override:
+            logger.info(
+                f"Modèle override : {model_override} (config : {settings.gemini_model_wiki})"
+            )
 
     def compile_article(
         self,
@@ -278,18 +304,25 @@ class WikiCompiler:
         logger.info(f"Compilation : {raw_path.name} ({len(article_content)} chars)")
 
         try:
-            raw_response = _call_gemini(
+            raw_response, input_tokens, output_tokens = _call_gemini(
                 content=article_content,
-                model_name=self._settings.gemini_model_wiki,
+                model_name=self.model_name,
                 api_key=self._settings.get_gemini_api_key(),
             )
+            result.input_tokens = input_tokens
+            result.output_tokens = output_tokens
         except RuntimeError as e:
             result.errors.append(f"Gemini : {e}")
             return result
 
+        logger.debug(f"Réponse brute Gemini ({len(raw_response)} chars) :\n{raw_response[:2000]}")
         knowledge = _parse_gemini_response(raw_response)
 
         if knowledge.is_empty():
+            logger.warning(
+                f"Réponse Gemini vide ou invalide pour {raw_path.name}. "
+                f"Réponse brute (500 premiers chars) : {raw_response[:500]!r}"
+            )
             result.errors.append("Aucune connaissance extraite (réponse Gemini vide ou invalide)")
             return result
 
@@ -375,6 +408,16 @@ class WikiCompiler:
         # Marquer l'article comme compilé dans le frontmatter
         self._mark_compiled(raw_path, post, knowledge)
 
+        # Mettre à jour le cache avec l'état de compilation
+        self.cache.set_article_state(
+            raw_path,
+            wiki_compiled=True,
+            concepts=all_concept_names,
+        )
+        # Mettre à jour les backlinks dans le cache
+        for concept_name in all_concept_names:
+            self.cache.add_backlink(concept_name, source_stem)
+
         logger.info(
             f"✅ {raw_path.name} : "
             f"{result.concepts_created} créés, "
@@ -420,11 +463,18 @@ class WikiCompiler:
             except Exception as e:
                 logger.error(f"Erreur génération index : {e}")
 
+        # Persister le cache après le batch
+        if batch.total_compiled > 0:
+            self.cache.save()
+
         logger.info(batch.summary())
         return batch
 
     def get_compilation_stats(self) -> dict:
         """Retourne les statistiques de compilation du vault.
+
+        Utilise le cache persistant pour éviter de scanner et parser
+        le frontmatter de tous les fichiers RAW (O(1) au lieu de O(n)).
 
         Returns:
             Dict avec total_raw, total_compiled, total_wiki_fiches,
@@ -433,19 +483,26 @@ class WikiCompiler:
         raw_root = self.vault_path / "00_RAW"
         wiki_root = self.vault_path / "02_WIKI"
 
+        # Nombre total d'articles RAW (simple comptage de fichiers, rapide)
         total_raw = len(list(raw_root.rglob("*.md"))) if raw_root.exists() else 0
 
-        # Compter les compilés (frontmatter wiki_compiled: true)
-        total_compiled = 0
-        for md in raw_root.rglob("*.md") if raw_root.exists() else []:
-            try:
-                post = frontmatter.load(str(md))
-                if post.metadata.get("wiki_compiled"):
-                    total_compiled += 1
-            except Exception:
-                pass
+        # Statistiques depuis le cache (O(1) au lieu de parser chaque fichier)
+        cache_stats = self.cache.get_compilation_stats_from_cache()
+        total_compiled = cache_stats["total_compiled"]
 
-        total_wiki = len(list(wiki_root.rglob("*.md"))) if wiki_root.exists() else 0
+        # Si le cache est désynchronisé (plus d'articles sur disque que dans le cache),
+        # reconstruire l'index articles
+        if total_raw > 0 and cache_stats["total_cached"] == 0:
+            logger.info("Cache articles vide, reconstruction...")
+            self.cache.rebuild_articles_index(raw_root)
+            self.cache.save()
+            cache_stats = self.cache.get_compilation_stats_from_cache()
+            total_compiled = cache_stats["total_compiled"]
+
+        total_wiki = self.cache.get_total_wiki_fiches()
+        # Fallback si le cache fiches est vide
+        if total_wiki == 0 and wiki_root.exists():
+            total_wiki = len(list(wiki_root.rglob("*.md")))
 
         return {
             "total_raw": total_raw,

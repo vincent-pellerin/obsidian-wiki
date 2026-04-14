@@ -11,14 +11,15 @@ Usage:
 import argparse
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # Ajouter la racine du projet au PYTHONPATH
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from src.config import get_settings
 from src.wiki.compiler import WikiCompiler
@@ -26,18 +27,54 @@ from src.wiki.models import BatchCompilationResult
 
 console = Console()
 
+# Prix par million de tokens (input, output) pour chaque modèle connu
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-2.5-flash": (0.15, 0.60),
+    "gemini-2.5-pro": (1.25, 5.00),
+    "gemini-2.0-flash-lite": (0.075, 0.30),
+    "gemini-2.0-flash": (0.10, 0.40),
+}
+
+
+LOG_FILE = Path(__file__).parent.parent / "logs" / "compile_wiki.log"
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 
 def setup_logging(level: str = "INFO") -> None:
-    """Configure le logging.
+    """Configure le logging console + fichier rotatif.
+
+    Fichier : logs/compile_wiki.log (5 MB × 3 fichiers max).
 
     Args:
-        level: Niveau de log.
+        level: Niveau de log (DEBUG, INFO, WARNING, ERROR).
     """
-    logging.basicConfig(
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-        level=getattr(logging, level),
+    log_level = getattr(logging, level)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE_FORMAT)
+
+    # Handler console
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # Réduire le bruit des librairies HTTP tierces (même en DEBUG)
+    for noisy_logger in ("httpcore", "httpx", "urllib3", "google_genai.models"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+    # Handler fichier rotatif
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=3,
+        encoding="utf-8",
     )
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
 
 
 def cmd_stats(compiler: WikiCompiler) -> None:
@@ -60,11 +97,27 @@ def cmd_stats(compiler: WikiCompiler) -> None:
     console.print(table)
 
 
-def print_batch_result(result: BatchCompilationResult) -> None:
+def _get_model_pricing(model_name: str) -> tuple[float, float] | None:
+    """Retourne le prix (input, output) par million de tokens pour un modèle.
+
+    Args:
+        model_name: Identifiant du modèle Gemini.
+
+    Returns:
+        Tuple (prix_input, prix_output) ou None si modèle inconnu.
+    """
+    for key, prices in _MODEL_PRICING.items():
+        if key in model_name:
+            return prices
+    return None
+
+
+def print_batch_result(result: BatchCompilationResult, model_name: str) -> None:
     """Affiche le résumé d'un batch de compilation.
 
     Args:
         result: Résultat du batch.
+        model_name: Nom du modèle utilisé (pour le calcul de coût réel).
     """
     # Tableau récapitulatif
     table = Table(title="Résultat de compilation", show_header=True, header_style="bold")
@@ -79,6 +132,39 @@ def print_batch_result(result: BatchCompilationResult) -> None:
         table.add_row("Erreurs", str(result.total_errors), style="red")
 
     console.print(table)
+
+    # Tableau coût réel (si tokens capturés via usage_metadata)
+    total_tokens = result.total_input_tokens + result.total_output_tokens
+    if total_tokens > 0:
+        pricing = _get_model_pricing(model_name)
+        cost_table = Table(title="Coût API réel", show_header=True, header_style="bold magenta")
+        cost_table.add_column("Métrique")
+        cost_table.add_column("Valeur", justify="right")
+
+        cost_table.add_row("Tokens input", f"{result.total_input_tokens:,}")
+        cost_table.add_row("Tokens output", f"{result.total_output_tokens:,}")
+        cost_table.add_row("Tokens total", f"{total_tokens:,}")
+
+        if pricing:
+            input_price, output_price = pricing
+            input_cost = (result.total_input_tokens / 1_000_000) * input_price
+            output_cost = (result.total_output_tokens / 1_000_000) * output_price
+            total_cost = input_cost + output_cost
+            cost_table.add_row("Coût input", f"${input_cost:.5f}", style="yellow")
+            cost_table.add_row("Coût output", f"${output_cost:.5f}", style="yellow")
+            cost_table.add_row("Coût total", f"${total_cost:.4f}", style="bold green")
+
+            if result.total_compiled > 0:
+                cost_per_article = total_cost / result.total_compiled
+                proj_5740 = cost_per_article * 5740
+                cost_table.add_row("Coût/article", f"${cost_per_article:.5f}", style="dim")
+                cost_table.add_row(
+                    "Projection 5 740 articles", f"${proj_5740:.2f}", style="bold cyan"
+                )
+        else:
+            cost_table.add_row("Coût", "[dim]modèle inconnu dans la grille tarifaire[/dim]")
+
+        console.print(cost_table)
 
     # Détail des erreurs
     if result.total_errors > 0:
@@ -132,6 +218,16 @@ Exemples:
         action="store_true",
         help="Ne pas régénérer l'index maître après compilation",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        metavar="MODEL",
+        help=(
+            "Override du modèle Gemini (ex: gemini-2.5-flash-lite). "
+            "Prend la priorité sur GEMINI_MODEL_WIKI dans .env"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -155,7 +251,15 @@ def main() -> int:
     console.print("[bold]🧠 obsidian-wiki — Compilation[/bold]")
     console.print(f"[dim]Vault : {settings.get_vault_path()}[/dim]")
 
-    compiler = WikiCompiler()
+    effective_model = args.model or settings.gemini_model_wiki
+    model_label = (
+        f"{effective_model} [bold yellow](override)[/bold yellow]"
+        if args.model
+        else effective_model
+    )
+    console.print(f"[dim]Modèle : {model_label}[/dim]")
+
+    compiler = WikiCompiler(model_override=args.model)
 
     # Mode stats uniquement
     if args.stats:
@@ -187,7 +291,7 @@ def main() -> int:
         )
         progress.update(task, completed=True)
 
-    print_batch_result(result)
+    print_batch_result(result, effective_model)
 
     if result.total_errors == 0:
         console.print("\n[bold green]✅ Compilation terminée.[/bold green]")
