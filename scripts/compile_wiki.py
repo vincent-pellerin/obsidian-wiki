@@ -229,9 +229,9 @@ Exemples:
     )
     parser.add_argument(
         "--source",
-        choices=["medium", "substack", "all"],
+        choices=["medium", "substack", "all", "longform"],
         default="all",
-        help="Source à compiler (défaut: all)",
+        help="Source à compiler (défaut: all). 'longform' compile 00_RAW/articles/longform/ avec 80k chars",
     )
     parser.add_argument(
         "--limit",
@@ -406,6 +406,7 @@ def main() -> int:
                 force=args.force,
                 rebuild_index=not args.no_index,
             )
+
         progress.update(task, completed=True)
 
     print_batch_result(result, effective_model, batch=is_batch, async_mode=is_async)

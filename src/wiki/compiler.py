@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 # Couvre ~95% des articles ; les articles plus longs sont tronqués proprement
 MAX_ARTICLE_CHARS = 20_000
 
+# Longueur maximale pour les articles longform (00_RAW/articles/longform/)
+MAX_ARTICLE_CHARS_LONGFORM = 80_000
+
 # Taille minimale de contenu utile (en caractères) pour qu'un article soit compilable
 # En dessous : CAPTCHA, 403, page vide, etc.
 MIN_ARTICLE_CHARS = 500
@@ -343,13 +346,19 @@ def _parse_gemini_response(raw_text: str) -> ExtractedKnowledge:
     return knowledge
 
 
-def _call_gemini(content: str, model_name: str, api_key: str) -> tuple[str, int, int]:
+def _call_gemini(
+    content: str,
+    model_name: str,
+    api_key: str,
+    max_chars: int = MAX_ARTICLE_CHARS,
+) -> tuple[str, int, int]:
     """Appelle l'API Gemini pour extraire les concepts d'un article.
 
     Args:
         content: Contenu de l'article à analyser.
         model_name: Nom du modèle Gemini.
         api_key: Clé API Gemini.
+        max_chars: Nombre maximum de caractères envoyés au LLM.
 
     Returns:
         Tuple (texte_réponse, input_tokens, output_tokens).
@@ -363,7 +372,7 @@ def _call_gemini(content: str, model_name: str, api_key: str) -> tuple[str, int,
         raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
 
     client = genai.Client(api_key=api_key)
-    prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:MAX_ARTICLE_CHARS])
+    prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:max_chars])
 
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -394,6 +403,7 @@ async def _call_gemini_async(
     model_name: str,
     api_key: str,
     semaphore: asyncio.Semaphore,
+    max_chars: int = MAX_ARTICLE_CHARS,
 ) -> tuple[str, int, int]:
     """Appelle l'API Gemini de façon asynchrone avec contrôle de concurrence.
 
@@ -402,6 +412,7 @@ async def _call_gemini_async(
         model_name: Nom du modèle Gemini.
         api_key: Clé API Gemini.
         semaphore: Semaphore asyncio pour limiter la concurrence.
+        max_chars: Nombre maximum de caractères envoyés au LLM.
 
     Returns:
         Tuple (texte_réponse, input_tokens, output_tokens).
@@ -415,7 +426,7 @@ async def _call_gemini_async(
         raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
 
     client = genai.Client(api_key=api_key)
-    prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:MAX_ARTICLE_CHARS])
+    prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:max_chars])
 
     last_error: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -496,6 +507,7 @@ class WikiCompiler:
         raw_path: Path,
         *,
         force: bool = False,
+        max_chars: int = MAX_ARTICLE_CHARS,
     ) -> CompilationResult:
         """Compile un article RAW en fiches wiki.
 
@@ -544,13 +556,16 @@ class WikiCompiler:
             logger.warning(f"Article invalide ignoré : {raw_path.name} — {invalid_reason}")
             return result
 
-        logger.info(f"Compilation : {raw_path.name} ({len(article_content)} chars)")
+        logger.info(
+            f"Compilation : {raw_path.name} ({len(article_content)} chars, max={max_chars:,})"
+        )
 
         try:
             raw_response, input_tokens, output_tokens = _call_gemini(
                 content=article_content,
                 model_name=self.model_name,
                 api_key=self._settings.get_gemini_api_key(),
+                max_chars=max_chars,
             )
             result.input_tokens = input_tokens
             result.output_tokens = output_tokens
@@ -581,28 +596,35 @@ class WikiCompiler:
         *,
         force: bool = False,
         rebuild_index: bool = True,
+        max_chars: int | None = None,
     ) -> BatchCompilationResult:
         """Compile tous les articles RAW d'une source donnée.
 
         Args:
-            source: Source à compiler ("medium", "substack", ou "all").
+            source: Source à compiler ("medium", "substack", "all" ou "longform").
             limit: Nombre maximum d'articles à traiter.
             force: Si True, recompile les articles déjà compilés.
             rebuild_index: Si True, régénère l'index maître à la fin.
+            max_chars: Limite de caractères envoyés au LLM (défaut selon source).
 
         Returns:
             BatchCompilationResult avec l'agrégat des résultats.
         """
+        effective_max_chars = max_chars or (
+            MAX_ARTICLE_CHARS_LONGFORM if source == "longform" else MAX_ARTICLE_CHARS
+        )
         articles = self._collect_articles(source)
         if limit:
             articles = articles[:limit]
 
-        logger.info(f"Batch compile : {len(articles)} articles (source={source})")
+        logger.info(
+            f"Batch compile : {len(articles)} articles (source={source}, max_chars={effective_max_chars:,})"
+        )
 
         batch = BatchCompilationResult()
         for i, article_path in enumerate(articles, 1):
             logger.info(f"[{i}/{len(articles)}] {article_path.name}")
-            result = self.compile_article(article_path, force=force)
+            result = self.compile_article(article_path, force=force, max_chars=effective_max_chars)
             batch.results.append(result)
 
         if rebuild_index and batch.total_compiled > 0:
@@ -649,6 +671,7 @@ class WikiCompiler:
         force: bool = False,
         concurrency: int = 15,
         rebuild_index: bool = True,
+        max_chars: int | None = None,
     ) -> BatchCompilationResult:
         """Compile les articles en parallèle via asyncio (mode async concurrent).
 
@@ -656,15 +679,19 @@ class WikiCompiler:
         Beaucoup plus rapide que le mode séquentiel (10-30x selon la concurrence).
 
         Args:
-            source: Source à compiler ("medium", "substack", ou "all").
+            source: Source à compiler ("medium", "substack", "all" ou "longform").
             limit: Nombre maximum d'articles à traiter.
             force: Si True, recompile les articles déjà compilés.
             concurrency: Nombre de requêtes Gemini simultanées (défaut: 15).
             rebuild_index: Si True, régénère l'index maître à la fin.
+            max_chars: Limite de caractères envoyés au LLM (défaut selon source).
 
         Returns:
             BatchCompilationResult avec l'agrégat des résultats.
         """
+        effective_max_chars = max_chars or (
+            MAX_ARTICLE_CHARS_LONGFORM if source == "longform" else MAX_ARTICLE_CHARS
+        )
         return asyncio.run(
             self._async_batch_compile_inner(
                 source=source,
@@ -672,6 +699,7 @@ class WikiCompiler:
                 force=force,
                 concurrency=concurrency,
                 rebuild_index=rebuild_index,
+                max_chars=effective_max_chars,
             )
         )
 
@@ -683,6 +711,7 @@ class WikiCompiler:
         force: bool,
         concurrency: int,
         rebuild_index: bool,
+        max_chars: int = MAX_ARTICLE_CHARS,
     ) -> BatchCompilationResult:
         """Implémentation interne async du mode concurrent.
 
@@ -692,6 +721,7 @@ class WikiCompiler:
             force: Recompiler les articles déjà compilés.
             concurrency: Nombre de requêtes simultanées.
             rebuild_index: Régénérer l'index maître.
+            max_chars: Limite de caractères envoyés au LLM.
 
         Returns:
             BatchCompilationResult agrégé.
@@ -732,7 +762,8 @@ class WikiCompiler:
             return BatchCompilationResult()
 
         logger.info(
-            f"Async compile : {len(pending)} articles | concurrence={concurrency} (source={source})"
+            f"Async compile : {len(pending)} articles | concurrence={concurrency} | "
+            f"max_chars={max_chars:,} (source={source})"
         )
 
         api_key = self._settings.get_gemini_api_key()
@@ -748,6 +779,7 @@ class WikiCompiler:
                     model_name=self.model_name,
                     api_key=api_key,
                     semaphore=semaphore,
+                    max_chars=max_chars,
                 )
                 result.input_tokens = input_tokens
                 result.output_tokens = output_tokens
@@ -1326,6 +1358,7 @@ class WikiCompiler:
             "medium": [raw_root / "medium"],
             "substack": [raw_root / "substack" / "posts", raw_root / "substack" / "newsletters"],
             "all": [raw_root / "medium", raw_root / "substack"],
+            "longform": [raw_root / "longform"],
         }
 
         dirs = sources_map.get(source, [raw_root])
