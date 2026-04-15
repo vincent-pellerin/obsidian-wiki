@@ -334,6 +334,7 @@ class ConceptManager:
             aliases=[],
             source_stem=source_stem,
             source_title=source_title,
+            related=data.related,
         )
 
     def create_or_update_technology(
@@ -366,6 +367,8 @@ class ConceptManager:
             source_stem=source_stem,
             source_title=source_title,
             category=data.type,
+            related=data.related,
+            questions=data.questions,
         )
 
     def create_or_update_topic(

@@ -41,12 +41,14 @@ class PersonData:
         role: Titre ou rôle (ex: "chercheur en ML").
         bio: Biographie courte (1-2 phrases sur qui est cette personne).
         context: Contexte de mention dans l'article.
+        related: Concepts, technologies ou personnes liés à cette personne.
     """
 
     name: str
     role: str
     bio: str = ""
     context: str = ""
+    related: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -58,12 +60,16 @@ class TechData:
         type: Catégorie (database|framework|library|platform|language|tool|service).
         description: Description technique autonome (ce que c'est, à quoi ça sert).
         context: Usage spécifique dans l'article.
+        related: Technologies alternatives/complémentaires et concepts liés.
+        questions: Questions techniques ouvertes sur cet outil.
     """
 
     name: str
     type: str
     description: str = ""
     context: str = ""
+    related: list[str] = field(default_factory=list)
+    questions: list[str] = field(default_factory=list)
 
 
 @dataclass

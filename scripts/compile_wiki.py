@@ -6,6 +6,8 @@ Usage:
     uv run python scripts/compile_wiki.py --source substack --limit 5
     uv run python scripts/compile_wiki.py --force
     uv run python scripts/compile_wiki.py --stats
+    uv run python scripts/compile_wiki.py --async
+    uv run python scripts/compile_wiki.py --async --concurrency 20 --source medium --limit 100
     uv run python scripts/compile_wiki.py --batch
     uv run python scripts/compile_wiki.py --batch --source medium --limit 100
     uv run python scripts/compile_wiki.py --batch-poll JOB_NAME
@@ -128,7 +130,10 @@ def _get_model_pricing(model_name: str, batch: bool = False) -> tuple[float, flo
 
 
 def print_batch_result(
-    result: BatchCompilationResult, model_name: str, batch: bool = False
+    result: BatchCompilationResult,
+    model_name: str,
+    batch: bool = False,
+    async_mode: bool = False,
 ) -> None:
     """Affiche le résumé d'un batch de compilation.
 
@@ -136,8 +141,14 @@ def print_batch_result(
         result: Résultat du batch.
         model_name: Nom du modèle utilisé (pour le calcul de coût réel).
         batch: Si True, utilise les prix Batch API.
+        async_mode: Si True, indique le mode async concurrent.
     """
-    mode_label = "Batch API" if batch else "Standard"
+    if batch:
+        mode_label = "Batch API"
+    elif async_mode:
+        mode_label = "Async concurrent"
+    else:
+        mode_label = "Standard"
     # Tableau récapitulatif
     table = Table(title="Résultat de compilation", show_header=True, header_style="bold")
     table.add_column("Métrique")
@@ -255,6 +266,19 @@ Exemples:
         ),
     )
     parser.add_argument(
+        "--async",
+        dest="async_mode",
+        action="store_true",
+        help="Mode async concurrent : N requêtes Gemini en parallèle (plus rapide)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=15,
+        metavar="N",
+        help="Nombre de requêtes Gemini simultanées en mode --async (défaut: 15)",
+    )
+    parser.add_argument(
         "--batch",
         action="store_true",
         help="Utiliser la Gemini Batch API (50%% moins cher, asynchrone)",
@@ -287,7 +311,13 @@ def main() -> int:
         return 1
 
     is_batch = args.batch or args.batch_poll
-    mode_label = "Batch API" if is_batch else "Standard"
+    is_async = getattr(args, "async_mode", False)
+    if is_batch:
+        mode_label = "Batch API"
+    elif is_async:
+        mode_label = f"Async concurrent (concurrence={args.concurrency})"
+    else:
+        mode_label = "Standard"
 
     console.print("[bold]🧠 obsidian-wiki — Compilation[/bold]")
     console.print(f"[dim]Vault : {settings.get_vault_path()}[/dim]")
@@ -361,6 +391,14 @@ def main() -> int:
             except RuntimeError as e:
                 console.print(f"[bold red]❌ Erreur batch : {e}[/bold red]")
                 return 1
+        elif is_async:
+            result = compiler.async_batch_compile(
+                source=args.source,
+                limit=args.limit,
+                force=args.force,
+                concurrency=args.concurrency,
+                rebuild_index=not args.no_index,
+            )
         else:
             result = compiler.batch_compile(
                 source=args.source,
@@ -370,7 +408,7 @@ def main() -> int:
             )
         progress.update(task, completed=True)
 
-    print_batch_result(result, effective_model, batch=is_batch)
+    print_batch_result(result, effective_model, batch=is_batch, async_mode=is_async)
 
     if result.total_errors == 0:
         console.print("\n[bold green]✅ Compilation terminée.[/bold green]")

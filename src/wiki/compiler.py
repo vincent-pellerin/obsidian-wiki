@@ -8,14 +8,17 @@ Orchestre le pipeline complet pour chaque article :
   5. Mise à jour de l'index maître
   6. Append au journal log.md
 
-Deux modes de compilation :
+Trois modes de compilation :
   - Synchrone (défaut) : un article à la fois via generate_content
+  - Async concurrent (--async) : N requêtes en parallèle via asyncio + semaphore
   - Batch API (--batch) : soumission groupée via client.batches.create,
     résultats récupérés après completion (50% moins cher)
 """
 
+import asyncio
 import logging
 import re
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -41,7 +44,27 @@ from src.wiki.models import (
 logger = logging.getLogger(__name__)
 
 # Longueur maximale du contenu envoyé au LLM (en caractères)
-MAX_ARTICLE_CHARS = 12_000
+# Couvre ~95% des articles ; les articles plus longs sont tronqués proprement
+MAX_ARTICLE_CHARS = 20_000
+
+# Taille minimale de contenu utile (en caractères) pour qu'un article soit compilable
+# En dessous : CAPTCHA, 403, page vide, etc.
+MIN_ARTICLE_CHARS = 500
+
+# Patterns indiquant un article invalide (CAPTCHA, erreur d'extraction)
+_INVALID_CONTENT_PATTERNS = [
+    "performing security verification",
+    "security service to protect against malicious bots",
+    "please enable javascript",
+    "just a moment",
+    "403 forbidden",
+    "404 not found",
+    "access denied",
+    "enable cookies",
+    "verify you are human",
+    "ddos protection",
+    "checking your browser",
+]
 
 # Nombre max de tentatives pour l'appel Gemini
 MAX_RETRIES = 3
@@ -134,11 +157,19 @@ people:
     role: "Titre professionnel précis (ex: 'Chercheur en ML chez Google', 'Fondateur de OpenAI')"
     bio: "Biographie courte (1-2 phrases) : qui est cette personne, pourquoi est-elle notable"
     context: "Pourquoi cette personne est mentionnée dans cet article"
+    related:
+      - "Concept, technologie ou personne liée A"
+      - "Concept, technologie ou personne liée B"
 technologies:
   - name: "Nom outil/techno"
     type: "database|framework|library|platform|language|tool|service"
     description: "Description technique autonome (1-2 phrases) : ce que c'est, à quoi ça sert"
     context: "Comment cet outil est utilisé ou mentionné dans cet article"
+    related:
+      - "Technologie alternative ou complémentaire A"
+      - "Concept ou écosystème lié B"
+    questions:
+      - "Question technique ouverte sur cet outil (comparaison, limite, cas d'usage)"
 topics:
   - name: "Sujet principal"
     definition: "Description du sujet (2-3 phrases) : de quoi il s'agit, pourquoi c'est important"
@@ -160,6 +191,28 @@ Règles strictes :
 Article :
 {article_content}
 """
+
+
+def _is_invalid_content(content: str) -> str | None:
+    """Détecte si le contenu d'un article est invalide (CAPTCHA, 403, page vide).
+
+    Args:
+        content: Contenu brut de l'article.
+
+    Returns:
+        Message d'erreur si invalide, None si contenu valide.
+    """
+    stripped = content.strip()
+
+    if len(stripped) < MIN_ARTICLE_CHARS:
+        return f"Contenu trop court ({len(stripped)} chars < {MIN_ARTICLE_CHARS} minimum)"
+
+    lower = stripped.lower()
+    for pattern in _INVALID_CONTENT_PATTERNS:
+        if pattern in lower:
+            return f"Contenu invalide détecté : '{pattern}'"
+
+    return None
 
 
 def _strip_yaml_fences(text: str) -> str:
@@ -256,6 +309,7 @@ def _parse_gemini_response(raw_text: str) -> ExtractedKnowledge:
                 role=str(item.get("role", "")),
                 bio=bio,
                 context=str(item.get("context", "")),
+                related=list(item.get("related") or []),
             )
         )
 
@@ -269,6 +323,8 @@ def _parse_gemini_response(raw_text: str) -> ExtractedKnowledge:
                 type=str(item.get("type", "tool")),
                 description=str(item.get("description", "")),
                 context=str(item.get("context", "")),
+                related=list(item.get("related") or []),
+                questions=list(item.get("questions") or []),
             )
         )
 
@@ -333,6 +389,62 @@ def _call_gemini(content: str, model_name: str, api_key: str) -> tuple[str, int,
     raise RuntimeError(f"Appel Gemini échoué après {MAX_RETRIES} tentatives") from last_error
 
 
+async def _call_gemini_async(
+    content: str,
+    model_name: str,
+    api_key: str,
+    semaphore: asyncio.Semaphore,
+) -> tuple[str, int, int]:
+    """Appelle l'API Gemini de façon asynchrone avec contrôle de concurrence.
+
+    Args:
+        content: Contenu de l'article à analyser.
+        model_name: Nom du modèle Gemini.
+        api_key: Clé API Gemini.
+        semaphore: Semaphore asyncio pour limiter la concurrence.
+
+    Returns:
+        Tuple (texte_réponse, input_tokens, output_tokens).
+
+    Raises:
+        RuntimeError: Si toutes les tentatives ont échoué.
+    """
+    try:
+        from google import genai
+    except ImportError as e:
+        raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
+
+    client = genai.Client(api_key=api_key)
+    prompt = CONCEPT_EXTRACTION_PROMPT.format(article_content=content[:MAX_ARTICLE_CHARS])
+
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with semaphore:
+                response = await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+            input_tokens = 0
+            output_tokens = 0
+            if response.usage_metadata:
+                input_tokens = response.usage_metadata.prompt_token_count or 0
+                output_tokens = response.usage_metadata.candidates_token_count or 0
+            return response.text, input_tokens, output_tokens
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    f"Gemini async tentative {attempt}/{MAX_RETRIES} échouée : {e}. "
+                    f"Retry dans {RETRY_DELAY_S}s..."
+                )
+                await asyncio.sleep(RETRY_DELAY_S)
+            else:
+                logger.error(f"Gemini async : {MAX_RETRIES} tentatives épuisées.")
+
+    raise RuntimeError(f"Appel Gemini async échoué après {MAX_RETRIES} tentatives") from last_error
+
+
 class WikiCompiler:
     """Compile les articles RAW en fiches wiki structurées.
 
@@ -369,6 +481,10 @@ class WikiCompiler:
         self.concept_manager = ConceptManager(cache=self.cache)
         self.linker = Linker(cache=self.cache)
         self.indexer = Indexer()
+
+        # Lock pour protéger _process_extraction_result en mode async concurrent
+        # (ConceptManager et Linker ne sont pas thread-safe)
+        self._process_lock = threading.Lock()
 
         if model_override:
             logger.info(
@@ -419,6 +535,13 @@ class WikiCompiler:
         article_content = post.content or ""
         if not article_content.strip():
             result.errors.append("Article vide, skip")
+            return result
+
+        # Détecter les articles invalides (CAPTCHA, 403, page vide)
+        invalid_reason = _is_invalid_content(article_content)
+        if invalid_reason:
+            result.skipped = True
+            logger.warning(f"Article invalide ignoré : {raw_path.name} — {invalid_reason}")
             return result
 
         logger.info(f"Compilation : {raw_path.name} ({len(article_content)} chars)")
@@ -515,6 +638,182 @@ class WikiCompiler:
         return batch
 
     # ------------------------------------------------------------------
+    # Mode Async Concurrent
+    # ------------------------------------------------------------------
+
+    def async_batch_compile(
+        self,
+        source: str = "all",
+        limit: int | None = None,
+        *,
+        force: bool = False,
+        concurrency: int = 15,
+        rebuild_index: bool = True,
+    ) -> BatchCompilationResult:
+        """Compile les articles en parallèle via asyncio (mode async concurrent).
+
+        Lance N requêtes Gemini simultanément, contrôlées par un semaphore.
+        Beaucoup plus rapide que le mode séquentiel (10-30x selon la concurrence).
+
+        Args:
+            source: Source à compiler ("medium", "substack", ou "all").
+            limit: Nombre maximum d'articles à traiter.
+            force: Si True, recompile les articles déjà compilés.
+            concurrency: Nombre de requêtes Gemini simultanées (défaut: 15).
+            rebuild_index: Si True, régénère l'index maître à la fin.
+
+        Returns:
+            BatchCompilationResult avec l'agrégat des résultats.
+        """
+        return asyncio.run(
+            self._async_batch_compile_inner(
+                source=source,
+                limit=limit,
+                force=force,
+                concurrency=concurrency,
+                rebuild_index=rebuild_index,
+            )
+        )
+
+    async def _async_batch_compile_inner(
+        self,
+        source: str,
+        limit: int | None,
+        *,
+        force: bool,
+        concurrency: int,
+        rebuild_index: bool,
+    ) -> BatchCompilationResult:
+        """Implémentation interne async du mode concurrent.
+
+        Args:
+            source: Source à compiler.
+            limit: Nombre maximum d'articles.
+            force: Recompiler les articles déjà compilés.
+            concurrency: Nombre de requêtes simultanées.
+            rebuild_index: Régénérer l'index maître.
+
+        Returns:
+            BatchCompilationResult agrégé.
+        """
+        articles = self._collect_articles(source)
+        if limit:
+            articles = articles[:limit]
+
+        # Filtrer les articles déjà compilés (sauf force)
+        pending: list[tuple[Path, str, str]] = []
+        for article_path in articles:
+            try:
+                post = frontmatter.load(str(article_path))
+            except Exception as e:
+                logger.warning(f"Lecture impossible {article_path.name} : {e}")
+                continue
+
+            if post.metadata.get("wiki_compiled") and not force:
+                logger.debug(f"Ignoré (déjà compilé) : {article_path.name}")
+                continue
+
+            content = post.content or ""
+            if not content.strip():
+                logger.warning(f"Article vide, ignoré : {article_path.name}")
+                continue
+
+            # Détecter les articles invalides (CAPTCHA, 403, page vide)
+            invalid_reason = _is_invalid_content(content)
+            if invalid_reason:
+                logger.warning(f"Article invalide ignoré : {article_path.name} — {invalid_reason}")
+                continue
+
+            title = str(post.metadata.get("title", article_path.stem))
+            pending.append((article_path, title, content))
+
+        if not pending:
+            logger.info("Aucun article à compiler.")
+            return BatchCompilationResult()
+
+        logger.info(
+            f"Async compile : {len(pending)} articles | concurrence={concurrency} (source={source})"
+        )
+
+        api_key = self._settings.get_gemini_api_key()
+        semaphore = asyncio.Semaphore(concurrency)
+        batch_result = BatchCompilationResult()
+
+        async def _process_one(article_path: Path, title: str, content: str) -> CompilationResult:
+            """Traite un article : appel Gemini async + traitement synchrone protégé."""
+            result = CompilationResult(article_path=article_path, article_title=title)
+            try:
+                raw_response, input_tokens, output_tokens = await _call_gemini_async(
+                    content=content,
+                    model_name=self.model_name,
+                    api_key=api_key,
+                    semaphore=semaphore,
+                )
+                result.input_tokens = input_tokens
+                result.output_tokens = output_tokens
+            except RuntimeError as e:
+                result.errors.append(f"Gemini : {e}")
+                return result
+
+            # _process_extraction_result modifie des fichiers et le cache —
+            # on le protège avec un lock pour éviter les race conditions
+            with self._process_lock:
+                self._process_extraction_result(
+                    raw_text=raw_response,
+                    raw_path=article_path,
+                    article_title=title,
+                    result=result,
+                )
+                result.input_tokens = input_tokens
+                result.output_tokens = output_tokens
+
+            return result
+
+        # Lancer toutes les tâches en parallèle
+        tasks = [_process_one(path, title, content) for path, title, content in pending]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, Exception):
+                # Erreur inattendue non capturée dans _process_one
+                err_result = CompilationResult(article_path=Path("unknown"))
+                err_result.errors.append(f"Exception inattendue : {res}")
+                batch_result.results.append(err_result)
+            else:
+                batch_result.results.append(res)
+
+        # Persister cache + index + log
+        if batch_result.total_compiled > 0:
+            if rebuild_index:
+                try:
+                    self.indexer.build_master_index()
+                except Exception as e:
+                    logger.error(f"Erreur génération index : {e}")
+
+            self.cache.save()
+
+            try:
+                append_log_entry(
+                    vault_path=self.vault_path,
+                    operation="compile-async",
+                    title=f"Async {batch_result.total_compiled} articles",
+                    details={
+                        "Source": source,
+                        "Concurrence": concurrency,
+                        "Fiches créées": batch_result.total_concepts_created,
+                        "Fiches mises à jour": batch_result.total_concepts_updated,
+                        "Erreurs": batch_result.total_errors,
+                        "Tokens input": batch_result.total_input_tokens,
+                        "Tokens output": batch_result.total_output_tokens,
+                    },
+                )
+            except OSError as e:
+                logger.warning(f"Impossible d'écrire dans log.md : {e}")
+
+        logger.info(batch_result.summary())
+        return batch_result
+
+    # ------------------------------------------------------------------
     # Mode Batch API Gemini
     # ------------------------------------------------------------------
 
@@ -569,6 +868,12 @@ class WikiCompiler:
             content = post.content or ""
             if not content.strip():
                 logger.warning(f"Article vide, ignoré : {article_path.name}")
+                continue
+
+            # Détecter les articles invalides (CAPTCHA, 403, page vide)
+            invalid_reason = _is_invalid_content(content)
+            if invalid_reason:
+                logger.warning(f"Article invalide ignoré : {article_path.name} — {invalid_reason}")
                 continue
 
             title = str(post.metadata.get("title", article_path.stem))
