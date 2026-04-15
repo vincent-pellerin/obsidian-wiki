@@ -71,7 +71,8 @@ _INVALID_CONTENT_PATTERNS = [
 
 # Nombre max de tentatives pour l'appel Gemini
 MAX_RETRIES = 3
-RETRY_DELAY_S = 5.0
+RETRY_DELAY_S = 5.0  # Délai par défaut (non-429)
+RETRY_DELAY_MAX_S = 120.0  # Délai maximum pour un retry 429
 
 # Paramètres Batch API
 BATCH_POLL_INTERVAL_S = 30
@@ -194,6 +195,39 @@ Règles strictes :
 Article :
 {article_content}
 """
+
+
+def _extract_retry_delay(error: Exception) -> float:
+    """Extrait le délai de retry depuis une erreur 429 de l'API Gemini.
+
+    L'API retourne un champ `retryDelay` (ex: "26s") dans les détails de
+    l'erreur. On le parse pour attendre exactement le bon délai au lieu
+    d'un délai fixe trop court.
+
+    Args:
+        error: Exception levée par l'API Gemini.
+
+    Returns:
+        Délai en secondes (retryDelay de l'API + 2s marge, ou RETRY_DELAY_S
+        par défaut si non parseable). Plafonné à RETRY_DELAY_MAX_S.
+    """
+    import re
+
+    error_str = str(error)
+
+    # Format "retryDelay": "26s" ou "retryDelay": "26.14s"
+    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s", error_str)
+    if match:
+        delay = float(match.group(1)) + 2.0  # +2s de marge
+        return min(delay, RETRY_DELAY_MAX_S)
+
+    # Format "retry in Xs" dans le message texte
+    match = re.search(r"retry in (\d+(?:\.\d+)?)s", error_str, re.IGNORECASE)
+    if match:
+        delay = float(match.group(1)) + 2.0
+        return min(delay, RETRY_DELAY_MAX_S)
+
+    return RETRY_DELAY_S
 
 
 def _is_invalid_content(content: str) -> str | None:
@@ -387,11 +421,12 @@ def _call_gemini(
         except Exception as e:
             last_error = e
             if attempt < MAX_RETRIES:
+                delay = _extract_retry_delay(e)
                 logger.warning(
                     f"Gemini tentative {attempt}/{MAX_RETRIES} échouée : {e}. "
-                    f"Retry dans {RETRY_DELAY_S}s..."
+                    f"Retry dans {delay:.1f}s..."
                 )
-                time.sleep(RETRY_DELAY_S)
+                time.sleep(delay)
             else:
                 logger.error(f"Gemini : {MAX_RETRIES} tentatives épuisées.")
 
@@ -445,11 +480,12 @@ async def _call_gemini_async(
         except Exception as e:
             last_error = e
             if attempt < MAX_RETRIES:
+                delay = _extract_retry_delay(e)
                 logger.warning(
                     f"Gemini async tentative {attempt}/{MAX_RETRIES} échouée : {e}. "
-                    f"Retry dans {RETRY_DELAY_S}s..."
+                    f"Retry dans {delay:.1f}s..."
                 )
-                await asyncio.sleep(RETRY_DELAY_S)
+                await asyncio.sleep(delay)
             else:
                 logger.error(f"Gemini async : {MAX_RETRIES} tentatives épuisées.")
 
