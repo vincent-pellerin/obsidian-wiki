@@ -4,7 +4,7 @@ Couvre :
 - Settings : defaults, validation, priorités
 - get_settings : cache, singleton
 - Settings.get_vault_path : priorité LOCAL_VAULT_PATH > VAULT_PATH
-- Settings.get_gemini_api_key : priorité GEMINI_API_KEY > GOOGLE_API_KEY
+- Settings.get_gemini_api_key : priorité GEMINI_API_KEY > GEMINI_API_KEY_2
 - Settings.validate_log_level : validation des niveaux de log
 """
 
@@ -80,14 +80,14 @@ class TestSettingsGetGeminiApiKey:
 
     def test_google_env_fallback(self):
         s = Settings(vault_path="/test", gemini_api_key="", google_api_key="")
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "google-env-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GEMINI_API_KEY_2": "google-env-key"}):
             assert s.get_gemini_api_key() == "google-env-key"
 
     def test_empty_when_no_keys(self):
         s = Settings(vault_path="/test", gemini_api_key="", google_api_key="")
         with patch.dict(os.environ, {}, clear=True):
             # Remove any env vars that might be set
-            for key in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
+            for key in ["GEMINI_API_KEY", "GEMINI_API_KEY_2"]:
                 os.environ.pop(key, None)
             assert s.get_gemini_api_key() == ""
 

@@ -34,21 +34,27 @@ console = Console()
 
 # Prix par million de tokens (input, output) pour chaque modèle connu
 # Standard pricing
+#
+# NOTE sur les thinking tokens :
+# - gemini-2.5-flash : thinking tokens ($3.50/M) inclus dans output_tokens
+#   Le prix affiché ($0.60/M) sous-estime le coût réel si thinking actif.
+# - gemini-2.5-flash-lite : PAS DE THINKING TOKENS (sûr pour compilation en masse)
+# - gemini-1.5-flash-lite : PAS DE THINKING TOKENS, 2M contexte, $0.08/$0.30
+#
+# → Recommandé pour compilation wiki : gemini-2.5-flash-lite (pas de surprise de coût)
 _MODEL_PRICING: dict[str, tuple[float, float]] = {
-    "gemini-2.5-flash-lite": (0.10, 0.40),
-    "gemini-2.5-flash": (0.15, 0.60),
+    "gemini-2.5-flash-lite": (0.10, 0.40),  # ← RECOMMANDÉ : pas de thinking, coût prévisible
+    "gemini-1.5-flash-lite": (0.08, 0.30),  # ← ÉCONOMIQUE : pas de thinking, 2M contexte
+    "gemini-2.5-flash": (0.15, 0.60),  # thinking tokens facturés à $3.50/M en sus
     "gemini-2.5-pro": (1.25, 5.00),
-    "gemini-2.0-flash-lite": (0.075, 0.30),
-    "gemini-2.0-flash": (0.10, 0.40),
 }
 
 # Batch API pricing (50% discount)
 _MODEL_BATCH_PRICING: dict[str, tuple[float, float]] = {
-    "gemini-2.5-flash-lite": (0.05, 0.20),
+    "gemini-2.5-flash-lite": (0.05, 0.20),  # ← RECOMMANDÉ : pas de thinking
+    "gemini-1.5-flash-lite": (0.04, 0.15),  # ← ÉCONOMIQUE : pas de thinking, 2M contexte
     "gemini-2.5-flash": (0.075, 0.30),
     "gemini-2.5-pro": (0.625, 2.50),
-    "gemini-2.0-flash-lite": (0.0375, 0.15),
-    "gemini-2.0-flash": (0.05, 0.20),
 }
 
 
@@ -219,9 +225,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples:
-  uv run python scripts/compile_wiki.py --stats
+  uv run python scripts/compile_wiki.py --dry-run              # Vérifier config
+  uv run python scripts/compile_wiki.py --stats                # Stats sans compiler
   uv run python scripts/compile_wiki.py --source medium --limit 10
   uv run python scripts/compile_wiki.py --source all --force
+  uv run python scripts/compile_wiki.py --async --concurrency 5
   uv run python scripts/compile_wiki.py --batch
   uv run python scripts/compile_wiki.py --batch --source medium --limit 100
   uv run python scripts/compile_wiki.py --batch-poll jobs/123456
@@ -290,6 +298,11 @@ Exemples:
         metavar="JOB_NAME",
         help="Récupérer les résultats d'un batch job existant",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Vérifier la configuration sans exécuter (clé API, modèle, vault path)",
+    )
     return parser.parse_args()
 
 
@@ -303,12 +316,85 @@ def main() -> int:
     settings = get_settings()
     setup_logging(settings.log_level)
 
-    # Vérification de la clé API (depuis .env ou variables d'environnement système)
+    # Vérification de la clé API (depuis GEMINI_API_KEY_2 uniquement)
     gemini_key = settings.get_gemini_api_key()
     if not gemini_key and not args.stats:
-        console.print("[bold red]❌ Clé API non configurée[/bold red]")
-        console.print("Ajoutez GEMINI_API_KEY ou GOOGLE_API_KEY dans .env ou ~/.zshenv")
+        console.print("[bold red]❌ Clé API GEMINI_API_KEY_2 non configurée[/bold red]")
+        console.print("\n[bold]Diagnostic de configuration :[/bold]")
+
+        config_status = settings.verify_config()
+        console.print(f"  Fichier .env : {config_status['env_file_path']}")
+        console.print(
+            f"  Existe : {'[green]✓[/green]' if config_status['env_file_exists'] else '[red]✗[/red]'}"
+        )
+        console.print(
+            f"  GEMINI_API_KEY_2 (env) : {'[green]✓[/green]' if config_status['gemini_api_key_2_env'] else '[red]✗[/red]'}"
+        )
+
+        console.print("\n[bold yellow]Solution :[/bold yellow]")
+        console.print("  Définissez GEMINI_API_KEY_2 dans ~/.zshenv :")
+        console.print("     export GEMINI_API_KEY_2=votre_cle_api")
+        console.print(
+            "\n[dim]Note : GEMINI_API_KEY et GOOGLE_API_KEY sont ignorés pour éviter les conflits.[/dim]"
+        )
         return 1
+
+    # Mode dry-run : vérifier la configuration sans exécuter
+    if args.dry_run:
+        console.print("[bold]🧪 obsidian-wiki — Dry Run (vérification configuration)[/bold]\n")
+
+        config_status = settings.verify_config()
+
+        table = Table(title="Configuration", show_header=True, header_style="bold blue")
+        table.add_column("Paramètre")
+        table.add_column("Valeur")
+        table.add_column("Statut", justify="center")
+
+        # Fichier .env
+        table.add_row(
+            "Fichier .env",
+            str(config_status["env_file_path"]),
+            "[green]✓[/green]" if config_status["env_file_exists"] else "[red]✗[/red]",
+        )
+
+        # Clé API
+        key = settings.get_gemini_api_key()
+        if key:
+            masked_key = "***" + key[-8:] if len(key) > 8 else "***"
+            table.add_row("Clé API (GEMINI_API_KEY_2)", masked_key, "[green]✓[/green]")
+        else:
+            table.add_row("Clé API (GEMINI_API_KEY_2)", "Non trouvée", "[red]✗[/red]")
+
+        # Modèle
+        effective_model = args.model or settings.gemini_model_wiki
+        table.add_row("Modèle Gemini", effective_model, "[green]✓[/green]")
+
+        # Vault path
+        table.add_row("Vault path", str(config_status["vault_path"]), "[green]✓[/green]")
+
+        # Concurrence
+        table.add_row("Concurrence", str(args.concurrency), "[green]✓[/green]")
+
+        console.print(table)
+
+        # Vérification finale
+        if key:
+            console.print("\n[bold green]✅ Configuration OK — Prêt pour compilation[/bold green]")
+            console.print("\n[dim]Pour lancer la compilation :[/dim]")
+            console.print(
+                f"  uv run python scripts/compile_wiki.py --concurrency {args.concurrency}"
+            )
+            return 0
+        else:
+            console.print(
+                "\n[bold red]❌ Configuration invalide — GEMINI_API_KEY_2 manquante[/bold red]"
+            )
+            console.print("\n[bold yellow]Action requise :[/bold yellow]")
+            console.print("  export GEMINI_API_KEY_2=votre_cle_api_dans_zshenv")
+            console.print(
+                "\n[dim]Note : GEMINI_API_KEY et GOOGLE_API_KEY sont ignorés pour éviter les conflits.[/dim]"
+            )
+            return 1
 
     is_batch = args.batch or args.batch_poll
     is_async = getattr(args, "async_mode", False)
@@ -322,13 +408,28 @@ def main() -> int:
     console.print("[bold]🧠 obsidian-wiki — Compilation[/bold]")
     console.print(f"[dim]Vault : {settings.get_vault_path()}[/dim]")
 
+    # Déterminer le modèle effectif avec priorité : CLI arg > .env > défaut
     effective_model = args.model or settings.gemini_model_wiki
+    model_source = "défaut"
+    if args.model:
+        model_source = "CLI --model"
+    elif settings.gemini_model_wiki != "gemini-2.5-flash-lite":
+        model_source = ".env"
+
     model_label = (
-        f"{effective_model} [bold yellow](override)[/bold yellow]"
-        if args.model
-        else effective_model
+        f"{effective_model} [bold yellow]({model_source})[/bold yellow]"
+        if model_source != "défaut"
+        else f"{effective_model} [dim](défaut)[/dim]"
     )
     console.print(f"[dim]Modèle : {model_label} | Mode : {mode_label}[/dim]")
+
+    # Vérifier que le modèle est bien celui attendu
+    if effective_model == "gemini-2.5-flash":
+        console.print(
+            "\n[bold yellow]⚠️  Attention :[/bold yellow] Vous utilisez gemini-2.5-flash avec thinking tokens"
+        )
+        console.print("   Ce modèle génère des tokens de raisonnement coûteux ($3.50/M).")
+        console.print("   Conseil : gemini-2.5-flash-lite (défaut) n'a pas de thinking tokens")
 
     compiler = WikiCompiler(model_override=args.model)
 

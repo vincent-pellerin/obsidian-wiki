@@ -10,6 +10,7 @@ Pipeline :
 
 import json
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -69,6 +70,10 @@ class QAEngine:
             logger.info(
                 f"Modèle override : {model_override} (config : {settings.gemini_model_wiki})"
             )
+        # Index stem normalisé → Path pour résoudre les chemins qmd
+        # qmd normalise les noms (lowercase + tirets) mais le filesystem
+        # utilise PascalCase + underscores → on construit un index de correspondance
+        self._wiki_stem_index: dict[str, Path] = self._build_stem_index()
 
     def query(self, question: str, max_sources: int = 10) -> QueryResult:
         """Répond à une question en s'appuyant sur le contenu du wiki.
@@ -123,6 +128,126 @@ class QAEngine:
             output_tokens=output_tokens,
         )
 
+    def _build_stem_index(self) -> dict[str, Path]:
+        """Construit un index stem normalisé → Path pour toutes les fiches wiki.
+
+        qmd normalise les noms de fichiers (lowercase, tirets) mais le filesystem
+        utilise PascalCase et underscores. Cet index permet de résoudre les chemins
+        retournés par qmd vers les vrais fichiers sur disque.
+
+        Returns:
+            Dictionnaire {stem_normalisé: Path} pour toutes les fiches de 02_WIKI/.
+        """
+        index: dict[str, Path] = {}
+        if not self.wiki_path.exists():
+            return index
+        for md_file in self.wiki_path.rglob("*.md"):
+            # Normaliser : lowercase + remplacer underscores et espaces par tirets
+            norm = md_file.stem.lower().replace("_", "-").replace(" ", "-")
+            index[norm] = md_file
+        logger.debug(f"Index wiki : {len(index)} fiches indexées")
+        return index
+
+    def _resolve_qmd_path(self, qmd_file: str) -> Path | None:
+        """Résout un chemin qmd://vault/... vers le Path filesystem réel.
+
+        Args:
+            qmd_file: Chemin au format qmd://vault/02-wiki/concepts/foo-bar.md
+
+        Returns:
+            Path filesystem si trouvé, None sinon.
+        """
+        # Accepter qmd://wiki/ (collection dédiée) ou qmd://vault/02-wiki/ (fallback)
+        if qmd_file.startswith("qmd://wiki/"):
+            rel = qmd_file.replace("qmd://wiki/", "")
+        elif qmd_file.startswith("qmd://vault/02-wiki/"):
+            rel = qmd_file.replace("qmd://vault/02-wiki/", "")
+        else:
+            return None
+        parts = rel.split("/")
+
+        # Le stem du fichier est la dernière partie sans extension
+        filename = parts[-1]
+        stem_norm = filename.replace(".md", "")
+
+        # Chercher dans l'index
+        path = self._wiki_stem_index.get(stem_norm)
+        if path and path.exists():
+            return path
+
+        return None
+
+    @staticmethod
+    def _extract_keywords(question: str) -> str:
+        """Extrait les mots-clés significatifs d'une question en langage naturel.
+
+        Supprime les mots vides français/anglais et la ponctuation pour améliorer
+        la précision de la recherche BM25.
+
+        Args:
+            question: Question en langage naturel.
+
+        Returns:
+            Chaîne de mots-clés pour la recherche BM25.
+        """
+        stopwords = {
+            "qu",
+            "est",
+            "ce",
+            "que",
+            "quoi",
+            "comment",
+            "pourquoi",
+            "quand",
+            "où",
+            "qui",
+            "quel",
+            "quelle",
+            "quels",
+            "quelles",
+            "le",
+            "la",
+            "les",
+            "un",
+            "une",
+            "des",
+            "du",
+            "de",
+            "d",
+            "l",
+            "en",
+            "et",
+            "ou",
+            "à",
+            "au",
+            "aux",
+            "par",
+            "pour",
+            "sur",
+            "dans",
+            "avec",
+            "sans",
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "what",
+            "how",
+            "why",
+            "when",
+            "where",
+            "who",
+            "which",
+            "est-ce",
+            "y-a-t-il",
+        }
+        # Supprimer ponctuation et apostrophes, passer en minuscules
+        # Conserver les tirets internes (ex: "fine-tuning") mais pas les mots vides avec tirets
+        cleaned = re.sub(r"[''\"?!.,;:()\[\]]", " ", question.lower())
+        words = [w for w in cleaned.split() if w and w not in stopwords and len(w) > 2]
+        return " ".join(words) if words else question
+
     def _search_wiki(self, question: str, max_results: int) -> list[Path]:
         """Recherche dans le wiki via qmd (BM25 full-text).
 
@@ -140,15 +265,21 @@ class QAEngine:
             logger.warning(f"Répertoire wiki introuvable : {self.wiki_path}")
             return []
 
+        # Extraire les mots-clés pour améliorer la recherche BM25
+        keywords = self._extract_keywords(question)
+        logger.debug(f"Keywords extraits : {keywords!r}")
+
         try:
             # Appel qmd search via subprocess
+            # La collection s'appelle "vault" (racine du vault Obsidian)
+            # On filtre ensuite sur 02_WIKI/ pour ne garder que les fiches compilées
             result = subprocess.run(
                 [
                     "qmd",
                     "search",
-                    question,
+                    keywords,
                     "-c",
-                    "wiki",
+                    "wiki",  # Collection dédiée aux fiches compilées (02_WIKI/)
                     "-n",
                     str(max_results),
                     "--json",
@@ -167,14 +298,14 @@ class QAEngine:
             paths: list[Path] = []
 
             for hit in hits:
-                # qmd retourne les chemins au format qmd://wiki/path/to/file.md
-                # On convertit en chemin filesystem
-                qmd_path = hit.get("path", "")
-                if qmd_path.startswith("qmd://wiki/"):
-                    rel_path = qmd_path.replace("qmd://wiki/", "")
-                    full_path = self.wiki_path / rel_path
-                    if full_path.exists():
-                        paths.append(full_path)
+                # qmd retourne les chemins au format qmd://vault/02-wiki/...
+                # On résout vers le vrai chemin filesystem via l'index de stems
+                qmd_file = hit.get("file", "")
+                resolved = self._resolve_qmd_path(qmd_file)
+                if resolved:
+                    paths.append(resolved)
+                    if len(paths) >= max_results:
+                        break
 
             logger.info(f"qmd search: {len(paths)} résultats pour {question[:50]!r}")
             return paths
@@ -239,7 +370,7 @@ class QAEngine:
 
         api_key = self._settings.get_gemini_api_key()
         if not api_key:
-            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY ou GOOGLE_API_KEY)")
+            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY ou GEMINI_API_KEY_2)")
 
         client = genai.Client(api_key=api_key)
         prompt = QA_PROMPT.format(context=context, question=question)

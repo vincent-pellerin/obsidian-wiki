@@ -182,7 +182,7 @@ class SlideGenerator:
 
         api_key = self._settings.get_gemini_api_key()
         if not api_key:
-            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY ou GOOGLE_API_KEY)")
+            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY ou GEMINI_API_KEY_2)")
 
         client = genai.Client(api_key=api_key)
         prompt = SLIDE_PROMPT.format(context=context, topic=topic)

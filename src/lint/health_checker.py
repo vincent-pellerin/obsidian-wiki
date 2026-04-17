@@ -141,7 +141,9 @@ class HealthChecker:
                     if not target or target.startswith("#"):
                         continue
                     # Normaliser : prendre seulement le nom de fichier (sans chemin)
-                    target_stem = Path(target).stem.lower()
+                    # Remplacer les espaces par des underscores pour matcher
+                    # les fichiers nommés avec underscores (ex: [[Knowledge Graph]] → Knowledge_Graph.md)
+                    target_stem = Path(target).stem.lower().replace(" ", "_")
                     if target_stem not in all_md_stems:
                         broken_links.append(
                             BrokenLink(
@@ -190,15 +192,18 @@ class HealthChecker:
         return orphaned
 
     def check_duplicate_concepts(self) -> list[DuplicateGroup]:
-        """Détecte les fiches dont les noms sont très similaires.
+        """Détecte les fiches dont les noms normalisés sont identiques.
 
-        Algorithme optimisé O(n) :
-        1. Normaliser les noms (lowercase, supprimer caractères spéciaux)
-        2. Phase 1 — Hash grouping : grouper par nom normalisé identique (O(n))
-        3. Phase 2 — Préfixe : trier puis scan linéaire pour trouver les préfixes (O(n log n))
+        Algorithme O(n) — hash grouping uniquement :
+        1. Normaliser les noms (lowercase, supprimer ponctuation/tirets/underscores)
+        2. Grouper les fiches par nom normalisé identique
+        3. Tout groupe avec 2+ fiches = doublon confirmé
+
+        La détection par préfixe a été volontairement supprimée car elle génère
+        trop de faux positifs (ex: "Abstraction" ≠ "Abstraction_Logicielle").
 
         Returns:
-            Liste des groupes de doublons potentiels.
+            Liste des groupes de doublons confirmés.
         """
         if not self.wiki_path.exists():
             return []
@@ -212,50 +217,14 @@ class HealthChecker:
             if normalized and len(normalized) >= 5:
                 fiches.append((normalized, md_file))
 
-        # Phase 1 — Hash grouping : noms normalisés identiques → O(n)
+        # Hash grouping : noms normalisés identiques → O(n)
         exact_groups: dict[str, list[Path]] = {}
         for norm, path in fiches:
             exact_groups.setdefault(norm, []).append(path)
 
-        # Phase 2 — Préfixe : tri + scan linéaire → O(n log n)
-        sorted_fiches = sorted(fiches, key=lambda x: x[0])
-        prefix_groups: dict[str, list[Path]] = {}
-
-        for idx in range(len(sorted_fiches) - 1):
-            norm_i, path_i = sorted_fiches[idx]
-            # Regarder les suivants tant qu'ils sont préfixés par norm_i
-            for jdx in range(idx + 1, len(sorted_fiches)):
-                norm_j, path_j = sorted_fiches[jdx]
-                if norm_j.startswith(norm_i) and norm_i != norm_j:
-                    key = norm_i
-                    if key not in prefix_groups:
-                        prefix_groups[key] = []
-                    if path_i not in prefix_groups[key]:
-                        prefix_groups[key].append(path_i)
-                    if path_j not in prefix_groups[key]:
-                        prefix_groups[key].append(path_j)
-                else:
-                    # Trié : dès qu'un suivant n'est plus préfixé, on arrête
-                    break
-
-        # Fusionner les deux sources de groupes
-        merged: dict[str, list[Path]] = {}
-
-        for key, paths in exact_groups.items():
-            if len(paths) >= 2:
-                merged[key] = list(paths)
-
-        for key, paths in prefix_groups.items():
-            if key in merged:
-                for p in paths:
-                    if p not in merged[key]:
-                        merged[key].append(p)
-            else:
-                merged[key] = list(paths)
-
         # Construire les DuplicateGroup en choisissant le canonical
         duplicate_groups: list[DuplicateGroup] = []
-        for paths in merged.values():
+        for paths in exact_groups.values():
             if len(paths) < 2:
                 continue
             canonical = self._pick_canonical(paths)
@@ -368,6 +337,197 @@ class HealthChecker:
                 pass
 
         return best_path
+
+    def merge_duplicates(self, groups: list[DuplicateGroup]) -> int:
+        """Fusionne les groupes de doublons dans leur fiche canonique.
+
+        Pour chaque groupe :
+        1. Consolide aliases, source_count, sources et concepts liés dans le canonical
+        2. Redirige tous les wikilinks du vault vers le canonical
+        3. Supprime les fichiers doublons
+
+        Args:
+            groups: Liste des groupes de doublons à fusionner.
+
+        Returns:
+            Nombre de fichiers doublons supprimés.
+        """
+        deleted = 0
+
+        for group in groups:
+            canonical_path = group.canonical
+            try:
+                canonical_post = frontmatter.load(str(canonical_path))
+            except Exception as e:
+                logger.warning(f"Impossible de lire le canonical {canonical_path.name} : {e}")
+                continue
+
+            # Accumuler les données des doublons
+            merged_aliases: list[str] = list(canonical_post.metadata.get("aliases", []) or [])
+            merged_source_count: int = int(canonical_post.metadata.get("source_count", 0) or 0)
+            merged_sources: list[str] = self._extract_section_items(
+                canonical_post.content or "", "Sources mentionnant ce concept"
+            )
+            merged_related: list[str] = self._extract_section_items(
+                canonical_post.content or "", "Concepts liés"
+            )
+
+            for dup_path in group.duplicates:
+                try:
+                    dup_post = frontmatter.load(str(dup_path))
+                except Exception as e:
+                    logger.warning(f"Impossible de lire le doublon {dup_path.name} : {e}")
+                    continue
+
+                # Fusionner aliases
+                for alias in dup_post.metadata.get("aliases", []) or []:
+                    if alias not in merged_aliases:
+                        merged_aliases.append(alias)
+                # Ajouter le stem du doublon comme alias s'il n'y est pas
+                dup_title = str(dup_post.metadata.get("title", dup_path.stem))
+                if dup_title not in merged_aliases:
+                    merged_aliases.append(dup_title)
+
+                # Additionner source_count
+                merged_source_count += int(dup_post.metadata.get("source_count", 0) or 0)
+
+                # Fusionner sources
+                for item in self._extract_section_items(
+                    dup_post.content or "", "Sources mentionnant ce concept"
+                ):
+                    if item not in merged_sources:
+                        merged_sources.append(item)
+
+                # Fusionner concepts liés
+                for item in self._extract_section_items(dup_post.content or "", "Concepts liés"):
+                    if item not in merged_related:
+                        merged_related.append(item)
+
+            # Mettre à jour le frontmatter du canonical
+            canonical_post.metadata["aliases"] = merged_aliases
+            canonical_post.metadata["source_count"] = merged_source_count
+            canonical_post.metadata["updated"] = str(__import__("datetime").date.today())
+
+            # Reconstruire le contenu avec les sections fusionnées
+            new_content = self._rebuild_content(
+                canonical_post.content or "",
+                merged_sources,
+                merged_related,
+            )
+            canonical_post.content = new_content
+
+            # Écrire le canonical mis à jour
+            try:
+                canonical_path.write_text(frontmatter.dumps(canonical_post), encoding="utf-8")
+                logger.info(f"Canonical mis à jour : {canonical_path.name}")
+            except Exception as e:
+                logger.warning(f"Erreur écriture canonical {canonical_path.name} : {e}")
+                continue
+
+            # Rediriger les wikilinks dans tout le vault
+            for dup_path in group.duplicates:
+                self._redirect_wikilinks(dup_path.stem, canonical_path.stem)
+
+            # Supprimer les doublons
+            for dup_path in group.duplicates:
+                try:
+                    dup_path.unlink()
+                    deleted += 1
+                    logger.info(f"Doublon supprimé : {dup_path.name}")
+                except Exception as e:
+                    logger.warning(f"Erreur suppression {dup_path.name} : {e}")
+
+        return deleted
+
+    def _extract_section_items(self, content: str, section_name: str) -> list[str]:
+        """Extrait les items (lignes non vides) d'une section markdown.
+
+        Args:
+            content: Contenu markdown de la fiche.
+            section_name: Nom de la section à extraire.
+
+        Returns:
+            Liste des lignes non vides de la section.
+        """
+        pattern = re.compile(
+            rf"^##\s+{re.escape(section_name)}\s*$",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        match = pattern.search(content)
+        if not match:
+            return []
+
+        start = match.end()
+        next_section = re.search(r"^##\s+", content[start:], re.MULTILINE)
+        section_content = (
+            content[start : start + next_section.start()] if next_section else content[start:]
+        )
+        return [line.strip() for line in section_content.splitlines() if line.strip()]
+
+    def _rebuild_content(
+        self,
+        content: str,
+        merged_sources: list[str],
+        merged_related: list[str],
+    ) -> str:
+        """Reconstruit le contenu en remplaçant les sections fusionnées.
+
+        Args:
+            content: Contenu original du canonical.
+            merged_sources: Items fusionnés pour "Sources mentionnant ce concept".
+            merged_related: Items fusionnés pour "Concepts liés".
+
+        Returns:
+            Contenu reconstruit avec les sections mises à jour.
+        """
+
+        def replace_section(text: str, section_name: str, new_items: list[str]) -> str:
+            pattern = re.compile(
+                rf"(^##\s+{re.escape(section_name)}\s*$)(.*?)(?=^##\s+|\Z)",
+                re.MULTILINE | re.IGNORECASE | re.DOTALL,
+            )
+            new_body = "\n" + "\n".join(new_items) + "\n\n"
+            result = pattern.sub(lambda m: m.group(1) + new_body, text)
+            # Si la section n'existait pas, l'ajouter en fin
+            if result == text and new_items:
+                result = text.rstrip() + f"\n\n## {section_name}\n" + "\n".join(new_items) + "\n"
+            return result
+
+        content = replace_section(content, "Sources mentionnant ce concept", merged_sources)
+        content = replace_section(content, "Concepts liés", merged_related)
+        return content
+
+    def _redirect_wikilinks(self, old_stem: str, new_stem: str) -> int:
+        """Remplace tous les [[old_stem]] par [[new_stem]] dans le vault.
+
+        Args:
+            old_stem: Stem du fichier doublon (sans extension).
+            new_stem: Stem du fichier canonical (sans extension).
+
+        Returns:
+            Nombre de fichiers modifiés.
+        """
+        modified = 0
+        # Patterns à remplacer : [[old_stem]] et [[old_stem|alias]]
+        pattern = re.compile(
+            rf"\[\[{re.escape(old_stem)}(\|[^\]]*)?\]\]",
+            re.IGNORECASE,
+        )
+
+        for md_file in self.vault_path.rglob("*.md"):
+            if md_file == self.vault_path / "02_WIKI" / md_file.relative_to(self.vault_path):
+                pass  # inclure les fiches wiki aussi
+            try:
+                original = md_file.read_text(encoding="utf-8")
+                updated = pattern.sub(lambda m: f"[[{new_stem}{m.group(1) or ''}]]", original)
+                if updated != original:
+                    md_file.write_text(updated, encoding="utf-8")
+                    modified += 1
+            except OSError:
+                pass
+
+        logger.debug(f"Wikilinks redirigés : [[{old_stem}]] → [[{new_stem}]] ({modified} fichiers)")
+        return modified
 
     def _is_section_empty(self, content: str, section_name: str) -> bool:
         """Vérifie si une section est vide ou contient un placeholder.

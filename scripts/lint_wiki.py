@@ -70,6 +70,11 @@ Exemples:
         help="Appliquer corrections automatiques (suppression des liens cassés)",
     )
     parser.add_argument(
+        "--merge-duplicates",
+        action="store_true",
+        help="Fusionner les doublons confirmés dans leur fiche canonique",
+    )
+    parser.add_argument(
         "--enrich",
         type=str,
         metavar="NAME",
@@ -349,6 +354,24 @@ def main() -> int:
         console.print("\n[bold]Application des corrections...[/bold]")
         fixes = apply_fixes(report)
         console.print(f"[green]{fixes} correction(s) appliquée(s).[/green]")
+
+    # Fusionner les doublons si --merge-duplicates
+    if args.merge_duplicates:  # argparse convertit --merge-duplicates → merge_duplicates
+        if not report.duplicate_groups:
+            console.print("\n[green]Aucun doublon à fusionner.[/green]")
+        else:
+            console.print(
+                f"\n[bold]Fusion de {len(report.duplicate_groups)} groupe(s) de doublons...[/bold]"
+            )
+            for group in report.duplicate_groups:
+                dups = ", ".join(p.stem for p in group.duplicates)
+                console.print(
+                    f"  [cyan]{group.canonical.stem}[/cyan] ← absorbe → [dim]{dups}[/dim]"
+                )
+            deleted = checker.merge_duplicates(report.duplicate_groups)
+            console.print(
+                f"[green]✅ {deleted} doublon(s) supprimé(s), wikilinks redirigés.[/green]"
+            )
 
     # Code de retour selon la santé
     if report.is_healthy:

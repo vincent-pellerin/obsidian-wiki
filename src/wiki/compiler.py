@@ -417,6 +417,12 @@ def _call_gemini(
             if response.usage_metadata:
                 input_tokens = response.usage_metadata.prompt_token_count or 0
                 output_tokens = response.usage_metadata.candidates_token_count or 0
+                # thinking tokens (gemini-2.5-flash) — facturés à $3.50/M mais non inclus
+                # dans candidates_token_count ; on les additionne pour un coût réel exact
+                thinking_tokens = getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
+                if thinking_tokens:
+                    logger.debug(f"Thinking tokens : {thinking_tokens:,} (inclus dans output)")
+                output_tokens += thinking_tokens
             return response.text, input_tokens, output_tokens
         except Exception as e:
             last_error = e
@@ -476,6 +482,12 @@ async def _call_gemini_async(
             if response.usage_metadata:
                 input_tokens = response.usage_metadata.prompt_token_count or 0
                 output_tokens = response.usage_metadata.candidates_token_count or 0
+                # thinking tokens (gemini-2.5-flash) — facturés à $3.50/M mais non inclus
+                # dans candidates_token_count ; on les additionne pour un coût réel exact
+                thinking_tokens = getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
+                if thinking_tokens:
+                    logger.debug(f"Thinking tokens : {thinking_tokens:,} (inclus dans output)")
+                output_tokens += thinking_tokens
             return response.text, input_tokens, output_tokens
         except Exception as e:
             last_error = e

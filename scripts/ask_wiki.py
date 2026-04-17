@@ -94,7 +94,7 @@ def main() -> int:
     gemini_key = settings.get_gemini_api_key()
     if not gemini_key:
         console.print("[bold red]❌ Clé API non configurée[/bold red]")
-        console.print("Ajoutez GEMINI_API_KEY ou GOOGLE_API_KEY dans .env ou ~/.zshenv")
+        console.print("Ajoutez GEMINI_API_KEY ou GEMINI_API_KEY_2 dans .env ou ~/.zshenv")
         return 1
 
     console.print("[bold]🧠 obsidian-wiki — Q&A[/bold]")
