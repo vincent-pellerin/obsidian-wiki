@@ -621,6 +621,10 @@ class WikiCompiler:
             result.errors.append(f"Gemini : {e}")
             return result
 
+        if raw_response is None:
+            result.errors.append("Gemini : réponse vide (None) — safety filter ou contenu bloqué")
+            return result
+
         logger.debug(f"Réponse brute Gemini ({len(raw_response)} chars) :\n{raw_response[:2000]}")
 
         # Traiter le résultat via la méthode partagée
