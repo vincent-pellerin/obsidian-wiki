@@ -128,7 +128,7 @@ uv sync
 uv run python scripts/ingest_all.py
 
 # --- Phase 2 : Compilation ---
-uv run python scripts/compile_wiki.py
+uv run python scripts/compile_wiki.py --async --concurrency 5
 
 # Mettre à jour l'index qmd après compilation
 qmd update

@@ -115,14 +115,16 @@ Copie les articles depuis les extracteurs vers `00_RAW/`. Déduplication automat
 ### Compile — Compilation wiki
 
 ```bash
-uv run python scripts/compile_wiki.py
-uv run python scripts/compile_wiki.py --source medium --limit 10
-uv run python scripts/compile_wiki.py --force
-uv run python scripts/compile_wiki.py --stats
-uv run python scripts/compile_wiki.py --model gemini-2.5-flash-lite
+uv run python scripts/compile_wiki.py --async                                    # Mode recommandé (concurrency=5)
+uv run python scripts/compile_wiki.py --async --concurrency 5                    # Explicite
+uv run python scripts/compile_wiki.py --async --source medium --limit 10
+uv run python scripts/compile_wiki.py --async --force
+uv run python scripts/compile_wiki.py --async --model gemini-2.5-flash-lite
+uv run python scripts/compile_wiki.py --stats                                    # Stats uniquement (pas de compilation)
 ```
 
 Transforme les articles RAW en fiches wiki via Gemini. Met à jour l'index et le log.
+Mode `--async` recommandé : 15 requêtes simultanées par défaut, `--concurrency 5` pour limiter le rate limit.
 
 ### Query — Questions/Réponses
 
