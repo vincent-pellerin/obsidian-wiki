@@ -1,7 +1,7 @@
 """Enricher — suggère et applique des améliorations au wiki.
 
 Détecte les connexions manquantes entre concepts et enrichit les fiches
-via Gemini en s'appuyant sur les sources disponibles.
+via LLM (Gemini ou Inception Labs) en s'appuyant sur les sources disponibles.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import frontmatter
 
@@ -20,22 +21,27 @@ from src.wiki.concept_manager import ConceptManager
 
 logger = logging.getLogger(__name__)
 
-# Nombre max de tentatives pour l'appel Gemini
+# Nombre max de tentatives pour l'appel LLM
 MAX_RETRIES = 5
 RETRY_DELAY_S = 30.0  # Délai initial, avec backoff exponentiel (×2)
 
 # Longueur maximale du contenu source envoyé au LLM
 MAX_SOURCE_CHARS = 3000
 
-# Timeout HTTP pour les appels Gemini (secondes)
-GEMINI_TIMEOUT_S = 60
+# Timeout HTTP pour les appels LLM (secondes)
+LLM_TIMEOUT_S = 60
 
 # Circuit breaker : nombre d'échecs 503 consécutifs avant d'arrêter le batch
 CIRCUIT_BREAKER_THRESHOLD = 5
 
 # Prix gemini-2.5-flash-lite ($/M tokens)
-_PRICE_INPUT = 0.10
-_PRICE_OUTPUT = 0.40
+_PRICE_INPUT_GEMINI = 0.10
+_PRICE_OUTPUT_GEMINI = 0.40
+
+# Prix Inception Labs mercury-2 (source: docs.inceptionlabs.ai)
+# Input: $0.25 / 1M tokens, Output: $0.75 / 1M tokens
+_PRICE_INPUT_INCEPTION = 0.25
+_PRICE_OUTPUT_INCEPTION = 0.75
 
 
 @dataclass
@@ -54,6 +60,7 @@ class EnrichBatchResult:
     """Résultat agrégé d'un batch d'enrichissement."""
 
     results: list[EnrichResult] = field(default_factory=list)
+    provider: str = "gemini"
 
     @property
     def total_enriched(self) -> int:
@@ -73,9 +80,14 @@ class EnrichBatchResult:
 
     @property
     def total_cost(self) -> float:
+        if self.provider == "inception":
+            return (
+                self.total_input_tokens / 1_000_000 * _PRICE_INPUT_INCEPTION
+                + self.total_output_tokens / 1_000_000 * _PRICE_OUTPUT_INCEPTION
+            )
         return (
-            self.total_input_tokens / 1_000_000 * _PRICE_INPUT
-            + self.total_output_tokens / 1_000_000 * _PRICE_OUTPUT
+            self.total_input_tokens / 1_000_000 * _PRICE_INPUT_GEMINI
+            + self.total_output_tokens / 1_000_000 * _PRICE_OUTPUT_GEMINI
         )
 
 ENRICH_PROMPT = """\
@@ -102,23 +114,42 @@ class Enricher:
     """Suggère et applique des améliorations au wiki.
 
     Analyse les connexions entre concepts et enrichit les fiches
-    avec Gemini en utilisant les sources disponibles.
+    avec LLM (Gemini ou Inception Labs) en utilisant les sources disponibles.
 
     Attributes:
         vault_path: Chemin racine du vault Obsidian.
         wiki_path: Chemin du répertoire 02_WIKI/.
         raw_path: Chemin du répertoire 00_RAW/.
-        model_name: Nom du modèle Gemini utilisé.
+        provider: Provider LLM utilisé ('gemini' ou 'inception').
+        model_name: Nom du modèle utilisé.
     """
 
-    def __init__(self) -> None:
-        """Initialise l'enricher avec la configuration courante."""
+    def __init__(
+        self,
+        provider: Literal["gemini", "inception"] = "gemini",
+        model_name: str | None = None,
+    ) -> None:
+        """Initialise l'enricher avec la configuration courante.
+
+        Args:
+            provider: Provider LLM à utiliser ('gemini' ou 'inception').
+            model_name: Nom du modèle à utiliser (défaut selon le provider).
+        """
         settings = get_settings()
         self.vault_path = Path(settings.get_vault_path())
         self.wiki_path = self.vault_path / "02_WIKI"
         self.raw_path = self.vault_path / "00_RAW"
         self._settings = settings
-        self.model_name = settings.gemini_model_wiki
+        self.provider = provider
+
+        # Définir le modèle par défaut selon le provider
+        if model_name:
+            self.model_name = model_name
+        elif provider == "inception":
+            self.model_name = "mercury-2"  # Correct: avec tiret selon doc officielle
+        else:
+            self.model_name = settings.gemini_model_wiki
+
         # Index en mémoire pour lookups O(1) au lieu de 3 scans complets
         self._concept_manager = ConceptManager()
 
@@ -233,15 +264,16 @@ class Enricher:
             logger.warning(f"Aucune source trouvée pour {concept_path.name}")
             sources_content = "Aucune source disponible."
 
-        # Appeler Gemini pour enrichir
+        # Appeler le LLM pour enrichir
         try:
-            enriched_content = self._call_gemini_enrich(
+            enriched_content = self._call_llm_enrich(
                 concept_name=concept_name,
                 current_content=current_content,
                 sources_content=sources_content,
             )
         except RuntimeError as e:
-            logger.error(f"Erreur Gemini enrichissement : {e}")
+            provider_name = "Inception" if self.provider == "inception" else "Gemini"
+            logger.error(f"Erreur {provider_name} enrichissement : {e}")
             return False
 
         # Mettre à jour la fiche
@@ -286,17 +318,35 @@ class Enricher:
         Returns:
             EnrichBatchResult agrégé.
         """
-        try:
-            from google import genai as _genai
-        except ImportError as e:
-            raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
+        # Initialiser le client selon le provider
+        if self.provider == "inception":
+            try:
+                from openai import AsyncOpenAI
+            except ImportError as e:
+                raise RuntimeError("openai non installé. Lancez : uv add openai") from e
 
-        api_key = self._settings.get_gemini_api_key()
-        if not api_key:
-            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY_2)")
+            api_key = self._settings.get_inception_api_key()
+            if not api_key:
+                raise RuntimeError("Clé API Inception non configurée (INCEPTION_API_KEY_2)")
+
+            client = AsyncOpenAI(
+                api_key=api_key,
+                base_url="https://api.inceptionlabs.ai/v1",
+            )
+        else:
+            try:
+                from google import genai as _genai
+            except ImportError as e:
+                raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
+
+            api_key = self._settings.get_gemini_api_key()
+            if not api_key:
+                raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY_2)")
+
+            client = _genai.Client(api_key=api_key)
 
         semaphore = asyncio.Semaphore(concurrency)
-        batch_result = EnrichBatchResult()
+        batch_result = EnrichBatchResult(provider=self.provider)
         lock = asyncio.Lock()
         # Circuit breaker : compteur d'échecs 503 consécutifs
         consecutive_503 = 0
@@ -329,11 +379,8 @@ class Enricher:
                 sources_content=sources_content[:MAX_SOURCE_CHARS],
             )
 
-            # Appel Gemini async avec semaphore
+            # Appel LLM async avec semaphore
             async with semaphore:
-                loop = asyncio.get_event_loop()
-                client = _genai.Client(api_key=api_key)
-
                 delay = RETRY_DELAY_S
                 for attempt in range(1, MAX_RETRIES + 1):
                     # Vérifier le circuit breaker avant chaque tentative
@@ -342,25 +389,47 @@ class Enricher:
                         return result
 
                     try:
-                        response = await asyncio.wait_for(
-                            loop.run_in_executor(
-                                None,
-                                lambda p=prompt: client.models.generate_content(
-                                    model=self.model_name, contents=p
+                        if self.provider == "inception":
+                            # Appel Inception Labs via client OpenAI
+                            response = await asyncio.wait_for(
+                                client.chat.completions.create(
+                                    model=self.model_name,
+                                    messages=[
+                                        {"role": "system", "content": "Tu es un expert en knowledge management. Enrichis la fiche wiki fournie."},
+                                        {"role": "user", "content": prompt},
+                                    ],
+                                    temperature=0.3,
                                 ),
-                            ),
-                            timeout=GEMINI_TIMEOUT_S,
-                        )
-                        enriched_text = response.text
-
-                        # Compter les tokens si disponibles
-                        try:
-                            result.input_tokens = response.usage_metadata.prompt_token_count or 0
-                            result.output_tokens = (
-                                response.usage_metadata.candidates_token_count or 0
+                                timeout=LLM_TIMEOUT_S,
                             )
-                        except Exception:
-                            pass
+                            enriched_text = response.choices[0].message.content
+
+                            # Compter les tokens si disponibles
+                            if response.usage:
+                                result.input_tokens = response.usage.prompt_tokens or 0
+                                result.output_tokens = response.usage.completion_tokens or 0
+                        else:
+                            # Appel Gemini
+                            loop = asyncio.get_event_loop()
+                            response = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    None,
+                                    lambda p=prompt: client.models.generate_content(
+                                        model=self.model_name, contents=p
+                                    ),
+                                ),
+                                timeout=LLM_TIMEOUT_S,
+                            )
+                            enriched_text = response.text
+
+                            # Compter les tokens si disponibles
+                            try:
+                                result.input_tokens = response.usage_metadata.prompt_token_count or 0
+                                result.output_tokens = (
+                                    response.usage_metadata.candidates_token_count or 0
+                                )
+                            except Exception:
+                                pass
 
                         # Succès → réinitialiser le circuit breaker
                         async with cb_lock:
@@ -369,39 +438,43 @@ class Enricher:
                         break
 
                     except asyncio.TimeoutError:
+                        provider_name = "Inception" if self.provider == "inception" else "Gemini"
                         logger.warning(
-                            f"Gemini enrich timeout ({GEMINI_TIMEOUT_S}s) "
+                            f"{provider_name} enrich timeout ({LLM_TIMEOUT_S}s) "
                             f"tentative {attempt}/{MAX_RETRIES} ({item.title})"
                         )
                         if attempt < MAX_RETRIES:
                             await asyncio.sleep(delay)
                             delay *= 2  # Backoff exponentiel
                         else:
-                            result.error = f"Gemini timeout après {MAX_RETRIES} tentatives"
+                            result.error = f"{provider_name} timeout après {MAX_RETRIES} tentatives"
 
                     except Exception as e:
                         error_str = str(e)
-                        is_503 = "503" in error_str or "UNAVAILABLE" in error_str
+                        is_503 = "503" in error_str or "UNAVAILABLE" in error_str or "rate limit" in error_str.lower()
 
                         if is_503:
                             async with cb_lock:
                                 consecutive_503 += 1
                                 if consecutive_503 >= CIRCUIT_BREAKER_THRESHOLD:
                                     circuit_open = True
+                                    provider_name = "Inception" if self.provider == "inception" else "Gemini"
                                     logger.error(
                                         f"Circuit breaker ouvert : {CIRCUIT_BREAKER_THRESHOLD} "
-                                        f"erreurs 503 consécutives. Arrêt du batch."
+                                        f"erreurs 503 consécutives ({provider_name}). Arrêt du batch."
                                     )
 
                         if attempt < MAX_RETRIES:
+                            provider_name = "Inception" if self.provider == "inception" else "Gemini"
                             logger.warning(
-                                f"Gemini enrich tentative {attempt}/{MAX_RETRIES} "
+                                f"{provider_name} enrich tentative {attempt}/{MAX_RETRIES} "
                                 f"({item.title}) : {e}. Retry dans {delay:.0f}s..."
                             )
                             await asyncio.sleep(delay)
                             delay *= 2  # Backoff exponentiel
                         else:
-                            result.error = f"Gemini échoué après {MAX_RETRIES} tentatives : {e}"
+                            provider_name = "Inception" if self.provider == "inception" else "Gemini"
+                            result.error = f"{provider_name} échoué après {MAX_RETRIES} tentatives : {e}"
 
             # Si circuit breaker ouvert, ne pas écrire
             if circuit_open:
@@ -440,13 +513,13 @@ class Enricher:
 
         return batch_result
 
-    def _call_gemini_enrich(
+    def _call_llm_enrich(
         self,
         concept_name: str,
         current_content: str,
         sources_content: str,
     ) -> str:
-        """Appelle Gemini pour enrichir le contenu d'une fiche.
+        """Appelle le LLM pour enrichir le contenu d'une fiche.
 
         Args:
             concept_name: Nom du concept à enrichir.
@@ -459,6 +532,31 @@ class Enricher:
         Raises:
             RuntimeError: Si toutes les tentatives ont échoué.
         """
+        prompt = ENRICH_PROMPT.format(
+            current_content=current_content,
+            sources_content=sources_content[:MAX_SOURCE_CHARS],
+        )
+
+        if self.provider == "inception":
+            return self._call_inception_sync(prompt)
+        else:
+            return self._call_gemini_sync(prompt)
+
+    def _call_gemini_sync(
+        self,
+        prompt: str,
+    ) -> str:
+        """Appelle Gemini de manière synchrone.
+
+        Args:
+            prompt: Prompt à envoyer au modèle.
+
+        Returns:
+            Réponse textuelle du modèle.
+
+        Raises:
+            RuntimeError: Si toutes les tentatives ont échoué.
+        """
         try:
             from google import genai
         except ImportError as e:
@@ -466,13 +564,9 @@ class Enricher:
 
         api_key = self._settings.get_gemini_api_key()
         if not api_key:
-            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY ou GEMINI_API_KEY_2)")
+            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY_2)")
 
         client = genai.Client(api_key=api_key)
-        prompt = ENRICH_PROMPT.format(
-            current_content=current_content,
-            sources_content=sources_content[:MAX_SOURCE_CHARS],
-        )
 
         last_error: Exception | None = None
         delay = RETRY_DELAY_S
@@ -494,6 +588,64 @@ class Enricher:
 
         raise RuntimeError(
             f"Appel Gemini enrich échoué après {MAX_RETRIES} tentatives"
+        ) from last_error
+
+    def _call_inception_sync(
+        self,
+        prompt: str,
+    ) -> str:
+        """Appelle Inception Labs de manière synchrone.
+
+        Args:
+            prompt: Prompt à envoyer au modèle.
+
+        Returns:
+            Réponse textuelle du modèle.
+
+        Raises:
+            RuntimeError: Si toutes les tentatives ont échoué.
+        """
+        try:
+            from openai import OpenAI
+        except ImportError as e:
+            raise RuntimeError("openai non installé. Lancez : uv add openai") from e
+
+        api_key = self._settings.get_inception_api_key()
+        if not api_key:
+            raise RuntimeError("Clé API Inception non configurée (INCEPTION_API_KEY_2)")
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.inceptionlabs.ai/v1",
+        )
+
+        last_error: Exception | None = None
+        delay = RETRY_DELAY_S
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": "Tu es un expert en knowledge management. Enrichis la fiche wiki fournie."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.3,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        f"Inception enrich tentative {attempt}/{MAX_RETRIES} échouée : {e}. "
+                        f"Retry dans {delay:.0f}s..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2  # Backoff exponentiel
+                else:
+                    logger.error(f"Inception enrich : {MAX_RETRIES} tentatives épuisées.")
+
+        raise RuntimeError(
+            f"Appel Inception enrich échoué après {MAX_RETRIES} tentatives"
         ) from last_error
 
     def _find_concept_file(self, concept_name: str) -> Path | None:

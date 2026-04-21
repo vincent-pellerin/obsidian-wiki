@@ -84,6 +84,31 @@ class Settings(BaseSettings):
 
         return key
 
+    def get_inception_api_key(self) -> str:
+        """Retourne la clé API Inception Labs depuis INCEPTION_API_KEY_2.
+
+        La clé doit être définie dans les variables d'environnement
+        (typiquement dans ~/.zshenv).
+        """
+        import os
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        key = os.environ.get("INCEPTION_API_KEY_2", "")
+
+        if not key:
+            logger.error(
+                "INCEPTION_API_KEY_2 non trouvée. "
+                "Définissez export INCEPTION_API_KEY_2=votre_cle dans ~/.zshenv "
+                "ou dans les variables d'environnement."
+            )
+        else:
+            masked = "***" + key[-8:] if len(key) > 8 else "***"
+            logger.info(f"Clé API INCEPTION_API_KEY_2 trouvée (terminaison : {masked})")
+
+        return key
+
     # Bridges
     medium_extract_output: str = "/home/vincent/dev/medium_extract/output"
     substack_extract_output: str = "/home/vincent/dev/substack_extract/output"

@@ -104,6 +104,19 @@ Exemples:
         metavar="N",
         help="Nombre maximum de fiches à enrichir avec --enrich-all",
     )
+    parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["gemini", "inception"],
+        default="gemini",
+        help="Provider LLM à utiliser pour l'enrichissement (défaut: gemini)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Nom du modèle à utiliser (défaut: gemini-2.5-flash-lite pour gemini, mercury2 pour inception)",
+    )
     return parser.parse_args()
 
 
@@ -331,16 +344,23 @@ def main() -> int:
 
     # Mode enrichissement d'un concept spécifique
     if args.enrich:
-        gemini_key = settings.get_gemini_api_key()
-        if not gemini_key:
-            console.print("[bold red]❌ Clé API non configurée[/bold red]")
+        # Vérifier la clé API selon le provider
+        if args.provider == "inception":
+            api_key = settings.get_inception_api_key()
+            provider_name = "Inception Labs"
+        else:
+            api_key = settings.get_gemini_api_key()
+            provider_name = "Gemini"
+
+        if not api_key:
+            console.print(f"[bold red]❌ Clé API {provider_name} non configurée[/bold red]")
             return 1
 
-        console.print(f"[dim]Enrichissement de : {args.enrich!r}...[/dim]")
+        console.print(f"[dim]Enrichissement de : {args.enrich!r} ({args.provider})...[/dim]")
         try:
             from src.lint.enricher import Enricher
 
-            enricher = Enricher()
+            enricher = Enricher(provider=args.provider, model_name=args.model)
             success = enricher.enrich_concept(args.enrich)
             if success:
                 console.print(f"[green]✅ Concept enrichi : {args.enrich}[/green]")
@@ -354,13 +374,22 @@ def main() -> int:
 
     # Mode enrichissement en masse (--enrich-all)
     if args.enrich_all:
-        gemini_key = settings.get_gemini_api_key()
-        if not gemini_key:
-            console.print("[bold red]❌ Clé API non configurée[/bold red]")
+        # Vérifier la clé API selon le provider
+        if args.provider == "inception":
+            api_key = settings.get_inception_api_key()
+            provider_name = "Inception Labs"
+            model_display = args.model or "mercury-2"
+        else:
+            api_key = settings.get_gemini_api_key()
+            provider_name = "Gemini"
+            model_display = args.model or settings.gemini_model_wiki
+
+        if not api_key:
+            console.print(f"[bold red]❌ Clé API {provider_name} non configurée[/bold red]")
             return 1
 
         console.print(
-            f"[dim]Mode : Enrich-all async (concurrence={args.concurrency})[/dim]\n"
+            f"[dim]Mode : Enrich-all async ({args.provider}/{model_display}, concurrence={args.concurrency})[/dim]\n"
         )
 
         # Détecter les fiches avec définitions manquantes
@@ -388,7 +417,7 @@ def main() -> int:
         try:
             from src.lint.enricher import Enricher
 
-            enricher = Enricher()
+            enricher = Enricher(provider=args.provider, model_name=args.model)
 
             with Progress(
                 SpinnerColumn(),
@@ -399,7 +428,7 @@ def main() -> int:
                 transient=True,
             ) as progress:
                 progress.add_task(
-                    f"Enrichissement async (concurrence={args.concurrency}) en cours...",
+                    f"Enrichissement async ({args.provider}, concurrence={args.concurrency}) en cours...",
                     total=None,
                 )
                 batch = enricher.enrich_all_async(missing, concurrency=args.concurrency)
