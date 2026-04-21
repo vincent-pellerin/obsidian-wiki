@@ -21,11 +21,17 @@ from src.wiki.concept_manager import ConceptManager
 logger = logging.getLogger(__name__)
 
 # Nombre max de tentatives pour l'appel Gemini
-MAX_RETRIES = 3
-RETRY_DELAY_S = 5.0
+MAX_RETRIES = 5
+RETRY_DELAY_S = 30.0  # Délai initial, avec backoff exponentiel (×2)
 
 # Longueur maximale du contenu source envoyé au LLM
 MAX_SOURCE_CHARS = 3000
+
+# Timeout HTTP pour les appels Gemini (secondes)
+GEMINI_TIMEOUT_S = 60
+
+# Circuit breaker : nombre d'échecs 503 consécutifs avant d'arrêter le batch
+CIRCUIT_BREAKER_THRESHOLD = 5
 
 # Prix gemini-2.5-flash-lite ($/M tokens)
 _PRICE_INPUT = 0.10
@@ -292,9 +298,21 @@ class Enricher:
         semaphore = asyncio.Semaphore(concurrency)
         batch_result = EnrichBatchResult()
         lock = asyncio.Lock()
+        # Circuit breaker : compteur d'échecs 503 consécutifs
+        consecutive_503 = 0
+        circuit_open = False
+        cb_lock = asyncio.Lock()
 
         async def _process_one(item) -> EnrichResult:
+            nonlocal consecutive_503, circuit_open
+
             result = EnrichResult(concept_name=item.title)
+
+            # Vérifier le circuit breaker avant de démarrer
+            if circuit_open:
+                result.error = "Circuit breaker ouvert : trop d'erreurs 503 consécutives"
+                return result
+
             concept_path = item.path
 
             try:
@@ -316,13 +334,22 @@ class Enricher:
                 loop = asyncio.get_event_loop()
                 client = _genai.Client(api_key=api_key)
 
+                delay = RETRY_DELAY_S
                 for attempt in range(1, MAX_RETRIES + 1):
+                    # Vérifier le circuit breaker avant chaque tentative
+                    if circuit_open:
+                        result.error = "Circuit breaker ouvert : trop d'erreurs 503 consécutives"
+                        return result
+
                     try:
-                        response = await loop.run_in_executor(
-                            None,
-                            lambda p=prompt: client.models.generate_content(
-                                model=self.model_name, contents=p
+                        response = await asyncio.wait_for(
+                            loop.run_in_executor(
+                                None,
+                                lambda p=prompt: client.models.generate_content(
+                                    model=self.model_name, contents=p
+                                ),
                             ),
+                            timeout=GEMINI_TIMEOUT_S,
                         )
                         enriched_text = response.text
 
@@ -335,17 +362,51 @@ class Enricher:
                         except Exception:
                             pass
 
+                        # Succès → réinitialiser le circuit breaker
+                        async with cb_lock:
+                            consecutive_503 = 0
+
                         break
+
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"Gemini enrich timeout ({GEMINI_TIMEOUT_S}s) "
+                            f"tentative {attempt}/{MAX_RETRIES} ({item.title})"
+                        )
+                        if attempt < MAX_RETRIES:
+                            await asyncio.sleep(delay)
+                            delay *= 2  # Backoff exponentiel
+                        else:
+                            result.error = f"Gemini timeout après {MAX_RETRIES} tentatives"
+
                     except Exception as e:
+                        error_str = str(e)
+                        is_503 = "503" in error_str or "UNAVAILABLE" in error_str
+
+                        if is_503:
+                            async with cb_lock:
+                                consecutive_503 += 1
+                                if consecutive_503 >= CIRCUIT_BREAKER_THRESHOLD:
+                                    circuit_open = True
+                                    logger.error(
+                                        f"Circuit breaker ouvert : {CIRCUIT_BREAKER_THRESHOLD} "
+                                        f"erreurs 503 consécutives. Arrêt du batch."
+                                    )
+
                         if attempt < MAX_RETRIES:
                             logger.warning(
                                 f"Gemini enrich tentative {attempt}/{MAX_RETRIES} "
-                                f"({item.title}) : {e}. Retry dans {RETRY_DELAY_S}s..."
+                                f"({item.title}) : {e}. Retry dans {delay:.0f}s..."
                             )
-                            await asyncio.sleep(RETRY_DELAY_S)
+                            await asyncio.sleep(delay)
+                            delay *= 2  # Backoff exponentiel
                         else:
                             result.error = f"Gemini échoué après {MAX_RETRIES} tentatives : {e}"
-                            return result
+
+            # Si circuit breaker ouvert, ne pas écrire
+            if circuit_open:
+                result.error = result.error or "Circuit breaker ouvert"
+                return result
 
             # Écriture protégée par lock (évite les race conditions sur le FS)
             async with lock:
@@ -368,6 +429,14 @@ class Enricher:
                 batch_result.results.append(err)
             else:
                 batch_result.results.append(res)
+
+        if circuit_open:
+            logger.error(
+                f"Batch interrompu par circuit breaker après "
+                f"{CIRCUIT_BREAKER_THRESHOLD} erreurs 503 consécutives. "
+                f"Résultats partiels : {batch_result.total_enriched} enrichies, "
+                f"{batch_result.total_errors} erreurs."
+            )
 
         return batch_result
 
@@ -406,6 +475,7 @@ class Enricher:
         )
 
         last_error: Exception | None = None
+        delay = RETRY_DELAY_S
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 response = client.models.generate_content(model=self.model_name, contents=prompt)
@@ -415,9 +485,10 @@ class Enricher:
                 if attempt < MAX_RETRIES:
                     logger.warning(
                         f"Gemini enrich tentative {attempt}/{MAX_RETRIES} échouée : {e}. "
-                        f"Retry dans {RETRY_DELAY_S}s..."
+                        f"Retry dans {delay:.0f}s..."
                     )
-                    time.sleep(RETRY_DELAY_S)
+                    time.sleep(delay)
+                    delay *= 2  # Backoff exponentiel
                 else:
                     logger.error(f"Gemini enrich : {MAX_RETRIES} tentatives épuisées.")
 
