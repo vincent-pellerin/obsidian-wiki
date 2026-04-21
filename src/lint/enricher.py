@@ -6,9 +6,11 @@ via Gemini en s'appuyant sur les sources disponibles.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import frontmatter
@@ -24,6 +26,51 @@ RETRY_DELAY_S = 5.0
 
 # Longueur maximale du contenu source envoyé au LLM
 MAX_SOURCE_CHARS = 3000
+
+# Prix gemini-2.5-flash-lite ($/M tokens)
+_PRICE_INPUT = 0.10
+_PRICE_OUTPUT = 0.40
+
+
+@dataclass
+class EnrichResult:
+    """Résultat d'enrichissement d'une fiche."""
+
+    concept_name: str
+    success: bool = False
+    input_tokens: int = 0
+    output_tokens: int = 0
+    error: str = ""
+
+
+@dataclass
+class EnrichBatchResult:
+    """Résultat agrégé d'un batch d'enrichissement."""
+
+    results: list[EnrichResult] = field(default_factory=list)
+
+    @property
+    def total_enriched(self) -> int:
+        return sum(1 for r in self.results if r.success)
+
+    @property
+    def total_errors(self) -> int:
+        return sum(1 for r in self.results if not r.success)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(r.input_tokens for r in self.results)
+
+    @property
+    def total_output_tokens(self) -> int:
+        return sum(r.output_tokens for r in self.results)
+
+    @property
+    def total_cost(self) -> float:
+        return (
+            self.total_input_tokens / 1_000_000 * _PRICE_INPUT
+            + self.total_output_tokens / 1_000_000 * _PRICE_OUTPUT
+        )
 
 ENRICH_PROMPT = """\
 Tu es un expert en knowledge management. Enrichis la fiche wiki suivante.
@@ -200,6 +247,129 @@ class Enricher:
         except OSError as e:
             logger.error(f"Impossible d'écrire {concept_path.name} : {e}")
             return False
+
+    def enrich_all_async(
+        self,
+        missing: list,
+        concurrency: int = 5,
+    ) -> EnrichBatchResult:
+        """Enrichit toutes les fiches avec définitions manquantes en parallèle.
+
+        Lance N appels Gemini simultanément via asyncio, contrôlés par un semaphore.
+
+        Args:
+            missing: Liste de MissingDefinition (depuis HealthChecker.check_missing_definitions).
+            concurrency: Nombre de requêtes Gemini simultanées (défaut: 5).
+
+        Returns:
+            EnrichBatchResult avec l'agrégat des résultats.
+        """
+        return asyncio.run(self._enrich_all_async_inner(missing, concurrency=concurrency))
+
+    async def _enrich_all_async_inner(
+        self,
+        missing: list,
+        concurrency: int,
+    ) -> EnrichBatchResult:
+        """Implémentation interne async de l'enrichissement en masse.
+
+        Args:
+            missing: Liste de MissingDefinition à enrichir.
+            concurrency: Nombre de requêtes simultanées.
+
+        Returns:
+            EnrichBatchResult agrégé.
+        """
+        try:
+            from google import genai as _genai
+        except ImportError as e:
+            raise RuntimeError("google-genai non installé. Lancez : uv sync") from e
+
+        api_key = self._settings.get_gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Clé API Gemini non configurée (GEMINI_API_KEY_2)")
+
+        semaphore = asyncio.Semaphore(concurrency)
+        batch_result = EnrichBatchResult()
+        lock = asyncio.Lock()
+
+        async def _process_one(item) -> EnrichResult:
+            result = EnrichResult(concept_name=item.title)
+            concept_path = item.path
+
+            try:
+                post = frontmatter.load(str(concept_path))
+            except Exception as e:
+                result.error = f"Lecture impossible : {e}"
+                return result
+
+            current_content = post.content or ""
+            sources_content = self._load_sources_content(post) or "Aucune source disponible."
+
+            prompt = ENRICH_PROMPT.format(
+                current_content=current_content,
+                sources_content=sources_content[:MAX_SOURCE_CHARS],
+            )
+
+            # Appel Gemini async avec semaphore
+            async with semaphore:
+                loop = asyncio.get_event_loop()
+                client = _genai.Client(api_key=api_key)
+
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        response = await loop.run_in_executor(
+                            None,
+                            lambda p=prompt: client.models.generate_content(
+                                model=self.model_name, contents=p
+                            ),
+                        )
+                        enriched_text = response.text
+
+                        # Compter les tokens si disponibles
+                        try:
+                            result.input_tokens = response.usage_metadata.prompt_token_count or 0
+                            result.output_tokens = (
+                                response.usage_metadata.candidates_token_count or 0
+                            )
+                        except Exception:
+                            pass
+
+                        break
+                    except Exception as e:
+                        if attempt < MAX_RETRIES:
+                            logger.warning(
+                                f"Gemini enrich tentative {attempt}/{MAX_RETRIES} "
+                                f"({item.title}) : {e}. Retry dans {RETRY_DELAY_S}s..."
+                            )
+                            await asyncio.sleep(RETRY_DELAY_S)
+                        else:
+                            result.error = f"Gemini échoué après {MAX_RETRIES} tentatives : {e}"
+                            return result
+
+            # Écriture protégée par lock (évite les race conditions sur le FS)
+            async with lock:
+                try:
+                    post.content = enriched_text
+                    concept_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+                    result.success = True
+                    logger.debug(f"Fiche enrichie : {concept_path.name}")
+                except OSError as e:
+                    result.error = f"Écriture impossible : {e}"
+
+            return result
+
+        tasks = [_process_one(item) for item in missing]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for res in results:
+            if isinstance(res, Exception):
+                err = EnrichResult(concept_name="unknown", error=f"Exception inattendue : {res}")
+                batch_result.results.append(err)
+            else:
+                batch_result.results.append(res)
+
+        return batch_result
 
     def _call_gemini_enrich(
         self,

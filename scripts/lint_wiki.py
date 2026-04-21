@@ -5,6 +5,7 @@ Usage:
     uv run python scripts/lint_wiki.py --report
     uv run python scripts/lint_wiki.py --fix
     uv run python scripts/lint_wiki.py --enrich NAME
+    uv run python scripts/lint_wiki.py --enrich-all --concurrency 5
 """
 
 import argparse
@@ -17,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 
@@ -57,6 +59,8 @@ Exemples:
   uv run python scripts/lint_wiki.py --report
   uv run python scripts/lint_wiki.py --fix
   uv run python scripts/lint_wiki.py --enrich GraphRAG
+  uv run python scripts/lint_wiki.py --enrich-all --concurrency 5
+  uv run python scripts/lint_wiki.py --enrich-all --concurrency 5 --limit 100
         """,
     )
     parser.add_argument(
@@ -79,6 +83,26 @@ Exemples:
         type=str,
         metavar="NAME",
         help="Enrichir un concept spécifique avec Gemini",
+    )
+    parser.add_argument(
+        "--enrich-all",
+        dest="enrich_all",
+        action="store_true",
+        help="Enrichir toutes les fiches avec définitions manquantes (mode async concurrent)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Nombre de requêtes Gemini simultanées pour --enrich-all (défaut: 5)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Nombre maximum de fiches à enrichir avec --enrich-all",
     )
     return parser.parse_args()
 
@@ -327,6 +351,92 @@ def main() -> int:
         except Exception as e:
             console.print(f"[bold red]❌ Erreur : {e}[/bold red]")
             return 1
+
+    # Mode enrichissement en masse (--enrich-all)
+    if args.enrich_all:
+        gemini_key = settings.get_gemini_api_key()
+        if not gemini_key:
+            console.print("[bold red]❌ Clé API non configurée[/bold red]")
+            return 1
+
+        console.print(
+            f"[dim]Mode : Enrich-all async (concurrence={args.concurrency})[/dim]\n"
+        )
+
+        # Détecter les fiches avec définitions manquantes
+        console.print("[dim]Détection des fiches à enrichir...[/dim]")
+        try:
+            checker = HealthChecker()
+            missing = checker.check_missing_definitions()
+        except Exception as e:
+            console.print(f"[bold red]❌ Erreur détection : {e}[/bold red]")
+            return 1
+
+        if not missing:
+            console.print("[green]✅ Aucune définition manquante — wiki complet ![/green]")
+            return 0
+
+        # Appliquer --limit si demandé
+        if args.limit:
+            missing = missing[: args.limit]
+
+        console.print(
+            f"[bold]{len(missing)} fiches à enrichir[/bold] "
+            f"[dim](concurrence={args.concurrency})[/dim]\n"
+        )
+
+        try:
+            from src.lint.enricher import Enricher
+
+            enricher = Enricher()
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                progress.add_task(
+                    f"Enrichissement async (concurrence={args.concurrency}) en cours...",
+                    total=None,
+                )
+                batch = enricher.enrich_all_async(missing, concurrency=args.concurrency)
+
+        except Exception as e:
+            console.print(f"[bold red]❌ Erreur enrichissement : {e}[/bold red]")
+            return 1
+
+        # Afficher le résumé
+        table = Table(
+            title="Résultat enrichissement",
+            show_header=True,
+            header_style="bold blue",
+        )
+        table.add_column("Métrique", style="bold")
+        table.add_column("Valeur", justify="right")
+        table.add_row("Fiches enrichies", str(batch.total_enriched), style="green")
+        table.add_row("Erreurs", str(batch.total_errors), style="red" if batch.total_errors else "")
+        table.add_row("Tokens input", f"{batch.total_input_tokens:,}")
+        table.add_row("Tokens output", f"{batch.total_output_tokens:,}")
+        table.add_row("Coût total", f"${batch.total_cost:.4f}")
+        if batch.total_enriched > 0:
+            table.add_row("Coût/fiche", f"${batch.total_cost / batch.total_enriched:.5f}")
+        console.print(table)
+
+        if batch.total_errors > 0:
+            console.print(f"\n[bold yellow]Erreurs détectées ({batch.total_errors}) :[/bold yellow]")
+            errors = [r for r in batch.results if not r.success]
+            for r in errors[:10]:
+                console.print(f"  • [dim]{r.concept_name}[/dim] : {r.error}")
+            if len(errors) > 10:
+                console.print(f"  [dim]... et {len(errors) - 10} autres[/dim]")
+            console.print(f"\n[bold yellow]⚠️  Terminé avec {batch.total_errors} erreur(s).[/bold yellow]")
+        else:
+            console.print(f"\n[bold green]✅ {batch.total_enriched} fiches enrichies avec succès.[/bold green]")
+
+        return 0
 
     # Health check complet
     console.print("[dim]Analyse en cours...[/dim]\n")
