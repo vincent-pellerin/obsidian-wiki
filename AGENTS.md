@@ -120,10 +120,11 @@ uv run python scripts/compile_wiki.py --async --concurrency 5                   
 uv run python scripts/compile_wiki.py --async --source medium --limit 10
 uv run python scripts/compile_wiki.py --async --force
 uv run python scripts/compile_wiki.py --async --model gemini-2.5-flash-lite
+uv run python scripts/compile_wiki.py --async --provider inception               # Inception Labs
 uv run python scripts/compile_wiki.py --stats                                    # Stats uniquement (pas de compilation)
 ```
 
-Transforme les articles RAW en fiches wiki via Gemini. Met à jour l'index et le log.
+Transforme les articles RAW en fiches wiki via LLM. Met à jour l'index et le log.
 Mode `--async` recommandé : 15 requêtes simultanées par défaut, `--concurrency 5` pour limiter le rate limit.
 
 ### Query — Questions/Réponses
@@ -148,13 +149,22 @@ Moteur de recherche externe (binaire Go, pas une dépendance Python).
 ### Lint — Health check
 
 ```bash
-uv run python scripts/lint_wiki.py
-uv run python scripts/lint_wiki.py --report
-uv run python scripts/lint_wiki.py --fix
-uv run python scripts/lint_wiki.py --enrich GraphRAG
+uv run python scripts/lint_wiki.py                                              # Health check complet
+uv run python scripts/lint_wiki.py --report                                     # Sauvegarder le rapport
+uv run python scripts/lint_wiki.py --fix                                        # Corriger automatiquement
+uv run python scripts/lint_wiki.py --enrich GraphRAG                            # Enrichir une fiche
+uv run python scripts/lint_wiki.py --enrich-all --concurrency 5                 # Enrichir toutes les fiches
+uv run python scripts/lint_wiki.py --enrich-all --concurrency 5 --limit 50      # Limiter à 50 fiches
+uv run python scripts/lint_wiki.py --enrich-all --provider inception            # Utiliser Inception Labs
 ```
 
 Vérifie la qualité du wiki : liens cassés, concepts orphelins, doublons, définitions manquantes.
+
+**Options enrichissement :**
+- `--provider {gemini,inception}` : Choix du provider LLM (défaut: gemini)
+- `--model MODEL` : Modèle spécifique (ex: mercury-2, gemini-2.5-flash-lite)
+- `--concurrency N` : Requêtes simultanées (défaut: 5, max recommandé: 10)
+- `--limit N` : Limite le nombre de fiches à enrichir
 
 ### Rapports et slides
 
@@ -170,15 +180,24 @@ uv run python scripts/generate_report.py "Knowledge Graphs" --slides
 ```env
 # .env (copier depuis .env.example)
 VAULT_PATH=/home/vincent/obsidian-second-brain-vps
-GEMINI_API_KEY=...
-GEMINI_MODEL_WIKI=gemini-2.5-flash
+
+# Providers LLM (définir les clés dans ~/.zshenv)
+GEMINI_API_KEY_2=...              # Pour Gemini (défaut)
+INCEPTION_API_KEY_2=...           # Pour Inception Labs
 ```
+
+### Providers LLM supportés
+
+| Provider | Modèle par défaut | Tarifs (input/output) | Rate limit | Usage |
+|----------|-------------------|----------------------|------------|-------|
+| **Gemini** (Google) | `gemini-2.5-flash-lite` | $0.10 / $0.40 | 60 req/min | `--provider gemini` (défaut) |
+| **Inception Labs** | `mercury-2` | $0.25 / $0.75 | 1000 req/min | `--provider inception` |
 
 ### Dépendances système
 
 - **qmd** : Moteur de recherche (`npm install -g @tobilu/qmd` ou `go install github.com/tobi/qmd@latest`)
 - **Python 3.12+** avec `uv`
-- **Gemini API** (Google AI)
+- **Gemini API** ou **Inception Labs API**
 
 ---
 

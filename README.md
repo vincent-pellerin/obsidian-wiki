@@ -139,6 +139,9 @@ uv run python scripts/ask_wiki.py "Qu'est-ce que GraphRAG ?"
 # --- Phase 4 : Health Check ---
 uv run python scripts/lint_wiki.py --report
 
+# Health check avec enrichissement Inception Labs
+uv run python scripts/lint_wiki.py --enrich-all --concurrency 5 --provider inception
+
 # --- Phase 5 : Recherche via qmd ---
 qmd search "RAG" -c wiki -n 10           # Recherche rapide (BM25)
 qmd query "comment déployer" -c wiki     # Recherche hybride (meilleure qualité)
@@ -148,12 +151,28 @@ qmd query "comment déployer" -c wiki     # Recherche hybride (meilleure qualit�
 
 ## Configuration
 
-```env
-# .env (copier depuis .env.example)
+### Variables d'environnement
+
+```bash
+# Copier depuis .env.example
 VAULT_PATH=/home/vincent/obsidian-second-brain-vps
-GEMINI_API_KEY=...
-GEMINI_MODEL_WIKI=gemini-2.5-flash
+
+# Provider Gemini (défaut)
+GEMINI_API_KEY_2=...              # Définir dans ~/.zshenv
+GEMINI_MODEL_WIKI=gemini-2.5-flash-lite
+
+# Provider Inception Labs (optionnel)
+INCEPTION_API_KEY_2=...           # Définir dans ~/.zshenv
 ```
+
+### Providers LLM supportés
+
+| Provider | Modèle par défaut | Tarifs (input/output) | Rate limit |
+|----------|-------------------|----------------------|------------|
+| **Gemini** (Google) | `gemini-2.5-flash-lite` | $0.10 / $0.40 par 1M tokens | 60 req/min (gratuit) |
+| **Inception Labs** | `mercury-2` | $0.25 / $0.75 par 1M tokens | 1000 req/min (payant) |
+
+Basculer entre les providers avec `--provider {gemini,inception}`.
 
 ### Dépendances système
 
